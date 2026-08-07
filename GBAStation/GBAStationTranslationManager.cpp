@@ -120,6 +120,10 @@ std::string TranslationManager::ReadConfiguredLanguage() const {
 			if (!value.empty() && value.front() == '"' && value.back() == '"' && value.size() >= 2) {
 				value = value.substr(1, value.size() - 2);
 			}
+			// Launcher config.cfg stores strings with an "s|" type prefix.
+			if (value.size() >= 2 && value[0] == 's' && value[1] == '|') {
+				value = value.substr(2);
+			}
 			if (value == "en-US" || value == "en") {
 				return "English";
 			}

@@ -129,7 +129,11 @@ private:
 	std::vector<CheatMenuEntry> cheats_;
 	u64 lastAnalogNavMs_ = 0;
 	u64 lastDPadNavMs_ = 0;
-	static constexpr u64 kDPadNavRepeatMs = 180;
+	// 3DS-style d-pad repeat: first repeat waits 280 ms, then speeds up.
+	static constexpr u64 kDPadNavInitialRepeatMs = 280;
+	int dpadNavDir_ = 0;
+	u64 nextDPadNavMs_ = 0;
+	u64 dpadNavStartMs_ = 0;
 	u64 nextCheatVerticalNavMs_ = 0;
 	u64 nextCheatHorizontalNavMs_ = 0;
 	int cheatVerticalNavDir_ = 0;

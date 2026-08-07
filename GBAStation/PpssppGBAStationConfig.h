@@ -54,4 +54,10 @@ int MaxPpssppIntegerScaleForCurrentDisplay();
 const char *DisplayModeLabel(DisplayMode mode);
 const char *DisplaySizeLabel(DisplaySize size);
 
+// Fast forward control (launcher config.cfg: fastforward.multiplier / fastforward.mode).
+float GetPspFastForwardMultiplier();
+void SetPspFastForwardMultiplier(float multiplier);
+bool GetPspFastForwardToggleMode();
+void SetPspFastForwardToggleMode(bool toggleMode);
+
 }  // namespace GBAStation

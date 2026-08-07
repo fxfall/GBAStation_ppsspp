@@ -815,6 +815,21 @@ void Overlay::CycleSetting(int direction) {
 		case 6: g_Config.iTexFiltering = g_Config.iTexFiltering >= 4 ? 1 : g_Config.iTexFiltering + 1; break;
 		case 7: g_Config.iAnisotropyLevel = (g_Config.iAnisotropyLevel + direction + 5) % 5; break;
 		case 8: g_Config.bTexDeposterize = !g_Config.bTexDeposterize; break;
+		case 9: {
+			static const float kMultipliers[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+			constexpr int kCount = 5;
+			float cur = GetPspFastForwardMultiplier();
+			int idx = 2;
+			for (int i = 0; i < kCount; ++i) {
+				if (cur <= kMultipliers[i] + 0.01f) { idx = i; break; }
+			}
+			idx = (idx + direction + kCount) % kCount;
+			SetPspFastForwardMultiplier(kMultipliers[idx]);
+			break;
+		}
+		case 10:
+			SetPspFastForwardToggleMode(!GetPspFastForwardToggleMode());
+			break;
 		default: break;
 		}
 		coreSettingsChanged_ = true;
@@ -925,19 +940,31 @@ bool Overlay::HandleInput(u64 buttons, u64 pressed, int leftStickX, int leftStic
 		// the LR value selectors can be adjusted without the d-pad.
 		bool navLeft = (pressed & (HidNpadButton_Left | HidNpadButton_L)) != 0;
 		bool navRight = (pressed & (HidNpadButton_Right | HidNpadButton_R)) != 0;
-		// Hold-to-repeat for the d-pad: first press fires on the edge, holding
-		// repeats every 180 ms (mirrors the analog stick repeat).
-		const bool heldUp = (buttons & HidNpadButton_Up) != 0;
-		const bool heldDown = (buttons & HidNpadButton_Down) != 0;
+		// Hold-to-repeat for the d-pad (3DS feel): first press fires on the
+		// edge, the first repeat waits 280 ms, then repeats speed up
+		// (128 ms -> 48 ms while held).
+		const int heldV = ((buttons & HidNpadButton_Up) ? -1 : 0) | ((buttons & HidNpadButton_Down) ? 1 : 0);
+		const int pressedV = ((pressed & HidNpadButton_Up) ? -1 : 0) | ((pressed & HidNpadButton_Down) ? 1 : 0);
 		const u64 nowMs = CurrentTimeMs();
-		if (heldUp && nowMs != 0 && nowMs - lastDPadNavMs_ >= kDPadNavRepeatMs && !(pressed & HidNpadButton_Up)) {
-			navUp = true;
+		if (pressedV != 0) {
+			dpadNavDir_ = pressedV;
+			nextDPadNavMs_ = nowMs + kDPadNavInitialRepeatMs;
+			dpadNavStartMs_ = nowMs;
+			navUp = pressedV < 0;
+			navDown = pressedV > 0;
+		} else if (heldV != 0 && dpadNavDir_ == heldV && nowMs >= nextDPadNavMs_) {
+			const u64 heldMs = nowMs - dpadNavStartMs_;
+			u64 interval = 128 - heldMs * 12 / 100;
+			if (interval < 48) {
+				interval = 48;
+			}
+			nextDPadNavMs_ = nowMs + interval;
+			navUp = heldV < 0;
+			navDown = heldV > 0;
 		}
-		if (heldDown && nowMs != 0 && nowMs - lastDPadNavMs_ >= kDPadNavRepeatMs && !(pressed & HidNpadButton_Down)) {
-			navDown = true;
-		}
-		if ((pressed & HidNpadButton_Up) || (pressed & HidNpadButton_Down)) {
-			lastDPadNavMs_ = nowMs;
+		if (heldV == 0) {
+			dpadNavDir_ = 0;
+			nextDPadNavMs_ = 0;
 		}
 		if (menu_ == Menu::Cheats) {
 			navUp = false;
@@ -1402,8 +1429,9 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 		if (coreSettingsPage_) {
 			const std::string labels[] = {
 				tr("跳帧"), tr("自动跳帧"), tr("快速内存"), tr("硬件变换"),
-				tr("跳过缓冲区效果"), tr("垂直同步"), tr("纹理过滤"), tr("各向异性过滤"), tr("纹理去色带")};
-			const int rowIcons[] = {0xE8B8, 0xE8E5, 0xE896, 0xE3B6, 0xE428, 0xE8F1, 0xE3F4, 0xE3F4, 0xE873};
+				tr("跳过缓冲区效果"), tr("垂直同步"), tr("纹理过滤"), tr("各向异性过滤"), tr("纹理去色带"),
+				tr("快进倍率"), tr("快进模式")};
+			const int rowIcons[] = {0xE8B8, 0xE8E5, 0xE896, 0xE3B6, 0xE428, 0xE8F1, 0xE3F4, 0xE3F4, 0xE873, 0xE8B2, 0xE8B8};
 			auto enabled = [](bool value) { return value ? std::string(tr("开启")) : std::string(tr("关闭")); };
 			auto settingValue = [&](int index) {
 				switch (index) {
@@ -1418,10 +1446,12 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 					return std::string(filters[std::clamp(g_Config.iTexFiltering, 0, 4)]);
 				}
 				case 7: return g_Config.iAnisotropyLevel == 0 ? std::string(tr("关闭")) : std::to_string(1 << g_Config.iAnisotropyLevel) + "x";
-				default: return enabled(g_Config.bTexDeposterize);
+				case 8: return enabled(g_Config.bTexDeposterize);
+				case 9: return std::to_string(static_cast<int>(GetPspFastForwardMultiplier())) + "x";
+				default: return GetPspFastForwardToggleMode() ? std::string(tr("切换")) : std::string(tr("按住"));
 				}
 			};
-			const int total = 9;
+			const int total = 11;
 			const int visible = std::min(8, total);
 			const int first = std::clamp(selection_ - visible / 2, 0, std::max(0, total - visible));
 			for (int row = 0; row < visible; ++row) {

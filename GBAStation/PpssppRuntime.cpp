@@ -127,6 +127,10 @@ struct RuntimeState {
 	bool cheatLoadThreadCreated = false;
 	int frameCount = 0;
 	std::unordered_map<std::string, std::string> gbastationConfig;
+	// Fast forward: toggle latch + multiplier (from launcher config.cfg).
+	bool fastForwardToggle = false;
+	bool fastForwardToggleMode = false;
+	float fastForwardMultiplier = 2.0f;
 };
 
 RuntimeState g_state;
@@ -226,6 +230,20 @@ void LoadGBAStationConfig() {
 		Log("loaded GBAStation config path=%s values=%u", path,
 			(unsigned)g_state.gbastationConfig.size());
 		break;
+	}
+
+	// Fast forward defaults from the launcher (same keys as the 3DS core).
+	if (const auto it = g_state.gbastationConfig.find("fastforward.multiplier");
+		it != g_state.gbastationConfig.end()) {
+		try {
+			g_state.fastForwardMultiplier =
+				std::clamp(std::stof(it->second), 0.5f, 5.0f);
+		} catch (...) {
+		}
+	}
+	if (const auto it = g_state.gbastationConfig.find("fastforward.mode");
+		it != g_state.gbastationConfig.end()) {
+		g_state.fastForwardToggleMode = (it->second == "toggle");
 	}
 }
 
@@ -1288,6 +1306,76 @@ void ExecuteOverlayCommand(OverlayCommand command) {
 }
 
 }  // namespace
+// Rewrite a single key in config.cfg (keeping the launcher's "s|" prefix).
+static void WriteConfigValue(const char *key, const std::string &value) {
+	const char *paths[] = {"sdmc:/GBAStation/config/config.cfg", "/GBAStation/config/config.cfg"};
+	std::string cfgPath;
+	for (const char *path : paths) {
+		std::ifstream in(path);
+		if (in.good()) {
+			cfgPath = path;
+			break;
+		}
+	}
+	if (cfgPath.empty()) {
+		return;
+	}
+
+	std::vector<std::string> lines;
+	{
+		std::ifstream in(cfgPath);
+		std::string line;
+		while (std::getline(in, line)) {
+			lines.push_back(line);
+		}
+	}
+
+	const std::string keyPrefix = std::string(key) + "=";
+	const std::string encoded = "s|" + value;
+	bool replaced = false;
+	for (std::string &line : lines) {
+		if (line.compare(0, keyPrefix.size(), keyPrefix) == 0) {
+			line = keyPrefix + encoded;
+			replaced = true;
+			break;
+		}
+	}
+	if (!replaced) {
+		lines.push_back(keyPrefix + encoded);
+	}
+
+	std::ofstream out(cfgPath, std::ios::trunc);
+	if (!out) {
+		return;
+	}
+	for (const std::string &line : lines) {
+		out << line << "\n";
+	}
+}
+
+float GetPspFastForwardMultiplier() {
+	return g_state.fastForwardMultiplier;
+}
+
+void SetPspFastForwardMultiplier(float multiplier) {
+	g_state.fastForwardMultiplier = std::clamp(multiplier, 0.5f, 5.0f);
+	char buf[32];
+	std::snprintf(buf, sizeof(buf), "%.2f", g_state.fastForwardMultiplier);
+	WriteConfigValue("fastforward.multiplier", buf);
+}
+
+bool GetPspFastForwardToggleMode() {
+	return g_state.fastForwardToggleMode;
+}
+
+void SetPspFastForwardToggleMode(bool toggleMode) {
+	g_state.fastForwardToggleMode = toggleMode;
+	if (!toggleMode) {
+		g_state.fastForwardToggle = false;
+	}
+	WriteConfigValue("fastforward.mode", toggleMode ? "toggle" : "hold");
+}
+
 
 PpssppRuntime::PpssppRuntime(LogCallback log) : log_(std::move(log)) {
 	g_state.log = log_;
@@ -1435,10 +1523,28 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 	if (inputConsumedByOverlay) {
 		ClearPspInput();
 		PSP_CoreParameter().fastForward = false;
+		PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
 	} else {
 		UpdatePspInput(input);
-		PSP_CoreParameter().fastForward = BindingHeld(
+		const bool ffHeld = BindingHeld(
 			"psp.handle.fastforward", "PAD_LSB", input.buttons);
+		const bool ffPressed = BindingPressedEdge(
+			"psp.handle.fastforward", "PAD_LSB", input.buttons, input.pressed);
+		if (g_state.fastForwardToggleMode) {
+			if (ffPressed) {
+				g_state.fastForwardToggle = !g_state.fastForwardToggle;
+			}
+		}
+		const bool ffActive = g_state.fastForwardToggleMode
+			? g_state.fastForwardToggle
+			: ffHeld;
+		PSP_CoreParameter().fastForward = ffActive;
+		if (ffActive && g_state.fastForwardMultiplier > 1.001f) {
+			PSP_CoreParameter().fpsLimit = FPSLimit::CUSTOM1;
+			g_Config.iFpsLimit1 = std::max(1, static_cast<int>(60.0f * g_state.fastForwardMultiplier));
+		} else {
+			PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
+		}
 	}
 }
 

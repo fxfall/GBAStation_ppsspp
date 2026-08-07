@@ -89,6 +89,7 @@ private:
 	int ItemCount() const;
 	int QuickMenuStorageIndex(int visibleIndex) const;
 	void DrawUI(float width, float height, float deltaTime);
+	void DrawHud(::ImDrawList *drawList, float width, float height);
 	void DrawBackground(::ImDrawList *drawList, ::ImVec2 displaySize, float ease);
 	void DrawMenu(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
 	void DrawHelpers(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);

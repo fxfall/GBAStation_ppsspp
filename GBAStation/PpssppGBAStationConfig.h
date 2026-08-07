@@ -59,5 +59,9 @@ float GetPspFastForwardMultiplier();
 void SetPspFastForwardMultiplier(float multiplier);
 bool GetPspFastForwardToggleMode();
 void SetPspFastForwardToggleMode(bool toggleMode);
+// HUD state.
+double GetPspCurrentFps();
+bool GetPspFastForwardActive();
+bool GetPspShowFps();
 
 }  // namespace GBAStation

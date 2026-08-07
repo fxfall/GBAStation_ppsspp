@@ -1654,13 +1654,61 @@ void Overlay::DrawUI(float width, float height, float deltaTime) {
 	DrawHelpers(drawList, displaySize, scale, ease);
 }
 
+void Overlay::DrawHud(ImDrawList *drawList, float width, float height) {
+	if (visible_) {
+		return; // HUD is hidden while the menu is open (matches the 3DS core).
+	}
+	const bool showFps = GetPspShowFps();
+	const bool fastForward = GetPspFastForwardActive();
+	if (!showFps && !fastForward) {
+		return;
+	}
+	if (!drawList || width <= 0.0f || height <= 0.0f) {
+		return;
+	}
+
+	// 3DS-style HUD: rounded translucent box top-left with green text.
+	const float em = std::max(14.0f, std::round(height / 32.0f));
+	const float margin = std::round(em * 0.6f);
+	const float pad = std::round(em * 0.35f);
+	const float fontScale = em / 21.0f;
+
+	std::string text;
+	if (showFps) {
+		char buf[16];
+		const int fps = std::clamp(static_cast<int>(std::lround(GetPspCurrentFps())), 0, 999);
+		std::snprintf(buf, sizeof(buf), "FPS %d", fps);
+		text = buf;
+	}
+	if (fastForward) {
+		if (!text.empty()) {
+			text += "   ";
+		}
+		char buf[16];
+		std::snprintf(buf, sizeof(buf), "FF %dx", static_cast<int>(GetPspFastForwardMultiplier()));
+		text += buf;
+	}
+
+	ImFont *font = ImGui::GetFont();
+	if (!font) {
+		return;
+	}
+	const ImVec2 textSize = font->CalcTextSizeA(font->FontSize * fontScale, FLT_MAX, 0.0f, text.c_str());
+	ImVec2 min(margin, margin);
+	ImVec2 max(margin + textSize.x + pad * 2.0f, margin + textSize.y + pad * 2.0f);
+	drawList->AddRectFilled(min, max, IM_COL32(0, 0, 0, 140), std::round(em * 0.25f));
+	drawList->AddText(font, font->FontSize * fontScale, ImVec2(min.x + pad, min.y + pad),
+		IM_COL32(135, 255, 135, 255), text.c_str());
+}
+
 void Overlay::Render(Draw::DrawContext *draw) {
 	if (!ready_ || !context_ || !draw) {
 		return;
 	}
 
 	const bool hasRAAlerts = !RetroAchievements().Notifications().empty();
-	if (!visible_ && !hasRAAlerts) {
+	const bool showHud = GetPspShowFps() || GetPspFastForwardActive();
+	if (!visible_ && !hasRAAlerts && !showHud) {
 		return;
 	}
 
@@ -1681,6 +1729,7 @@ void Overlay::Render(Draw::DrawContext *draw) {
 
 	ImGui_ImplThin3d_NewFrame(draw, ComputeOrthoMatrix(orthoW, orthoH, draw->GetDeviceCaps().coordConvention));
 	ImGui::NewFrame();
+	DrawHud(ImGui::GetForegroundDrawList(), width, height);
 	if (visible_) {
 		DrawUI(width, height, io.DeltaTime);
 	}

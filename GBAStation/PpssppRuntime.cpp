@@ -131,6 +131,11 @@ struct RuntimeState {
 	bool fastForwardToggle = false;
 	bool fastForwardToggleMode = false;
 	float fastForwardMultiplier = 2.0f;
+	bool fastForwardActive = false;
+	// FPS counter for the HUD.
+	double fps = 60.0;
+	int fpsFrameCount = 0;
+	u64 fpsWindowStartMs = 0;
 };
 
 RuntimeState g_state;
@@ -1376,6 +1381,22 @@ void SetPspFastForwardToggleMode(bool toggleMode) {
 	WriteConfigValue("fastforward.mode", toggleMode ? "toggle" : "hold");
 }
 
+double GetPspCurrentFps() {
+	return g_state.fps;
+}
+
+bool GetPspFastForwardActive() {
+	return g_state.fastForwardActive;
+}
+
+bool GetPspShowFps() {
+	const auto it = g_state.gbastationConfig.find("display.showFps");
+	if (it == g_state.gbastationConfig.end()) {
+		return false;
+	}
+	return it->second == "true" || it->second == "1";
+}
+
 
 PpssppRuntime::PpssppRuntime(LogCallback log) : log_(std::move(log)) {
 	g_state.log = log_;
@@ -1522,6 +1543,7 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 
 	if (inputConsumedByOverlay) {
 		ClearPspInput();
+		g_state.fastForwardActive = false;
 		PSP_CoreParameter().fastForward = false;
 		PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
 	} else {
@@ -1538,6 +1560,7 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 		const bool ffActive = g_state.fastForwardToggleMode
 			? g_state.fastForwardToggle
 			: ffHeld;
+		g_state.fastForwardActive = ffActive;
 		PSP_CoreParameter().fastForward = ffActive;
 		if (ffActive && g_state.fastForwardMultiplier > 1.001f) {
 			PSP_CoreParameter().fpsLimit = FPSLimit::CUSTOM1;
@@ -1557,6 +1580,23 @@ void PpssppRuntime::RunFrame() {
 		Log("main loop entered");
 	}
 	g_state.frameCount++;
+	// HUD FPS: measure every 500 ms so the value updates ~2x per second.
+	{
+		const u64 nowMs = (u64)(time_now_d() * 1000.0);
+		if (g_state.fpsWindowStartMs == 0) {
+			g_state.fpsWindowStartMs = nowMs;
+		} else {
+			++g_state.fpsFrameCount;
+			if (nowMs - g_state.fpsWindowStartMs >= 500) {
+				const double seconds = (double)(nowMs - g_state.fpsWindowStartMs) / 1000.0;
+				if (seconds > 0.0) {
+					g_state.fps = (double)g_state.fpsFrameCount / seconds;
+				}
+				g_state.fpsFrameCount = 0;
+				g_state.fpsWindowStartMs = nowMs;
+			}
+		}
+	}
 	UpdateDisplayMode();
 	if (g_state.graphicsContext) {
 		g_state.graphicsContext->Poll();

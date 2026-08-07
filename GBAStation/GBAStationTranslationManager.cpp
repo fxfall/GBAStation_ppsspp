@@ -130,6 +130,12 @@ std::string TranslationManager::ReadConfiguredLanguage() const {
 			if (value == "zh-CN" || value == "zh-Hans" || value == "zh") {
 				return "Chinese";
 			}
+			if (value == "ja-JP" || value == "ja") {
+				return "Japanese";
+			}
+			// UI.language exists: trust it over general.jsonc even if the
+			// value is unknown.
+			return value;
 		}
 	}
 
@@ -182,10 +188,13 @@ std::string TranslationManager::LanguageFileName(const std::string &language) co
 }
 
 bool TranslationManager::LoadLanguageFile(const std::string &fileName) {
+	// The bundled romfs tables always win: they carry both key-based and
+	// Chinese-literal entries. User files under PSP paths are only a fallback
+	// and are ignored when the built-in file exists.
 	const std::array<std::string, 3> paths = {{
+		std::string("romfs:/lang/") + fileName,
 		std::string(Paths::Lang) + "/" + fileName,
 		std::string("sdmc:/GBAStation/PSP/assets/lang/") + fileName,
-		std::string("romfs:/lang/") + fileName,
 	}};
 
 	for (const std::string &path : paths) {

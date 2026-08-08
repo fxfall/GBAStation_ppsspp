@@ -1172,15 +1172,8 @@ void WriteStateThumbnail(const std::string &statePath) {
 	raw.reserve(static_cast<size_t>(w) * (h + 1) * 3 / 2);
 	for (uint32_t y = 0; y < h; ++y) {
 		raw.push_back(0); // filter: None
-		const uint8_t *row = g_state.thumbMemory.data() + static_cast<size_t>(y) * w * 4;
-		// The Vulkan backbuffer readback is BGRA; convert to RGBA for the PNG.
-		for (uint32_t x = 0; x < w; ++x) {
-			const uint8_t *p = row + static_cast<size_t>(x) * 4;
-			raw.push_back(p[2]); // R
-			raw.push_back(p[1]); // G
-			raw.push_back(p[0]); // B
-			raw.push_back(p[3]); // A
-		}
+		raw.insert(raw.end(), g_state.thumbMemory.begin() + static_cast<ptrdiff_t>(y) * w * 4,
+			g_state.thumbMemory.begin() + static_cast<ptrdiff_t>(y + 1) * w * 4);
 	}
 
 	uLongf compressedSize = compressBound(static_cast<uLong>(raw.size()));
@@ -1780,11 +1773,25 @@ void PpssppRuntime::RenderFrame() {
 	if (g_state.menuPendingThumb) {
 		GPUDebugBuffer buf;
 		if (::GetOutputFramebuffer(g_state.draw, buf)) {
-			g_state.thumbW = static_cast<uint32_t>(buf.GetStride());
-			g_state.thumbH = static_cast<uint32_t>(buf.GetHeight());
-			const size_t size = static_cast<size_t>(g_state.thumbW) * g_state.thumbH * 4;
-			g_state.thumbMemory.assign(buf.GetData(), buf.GetData() + size);
-			Log("GBAStation menu thumbnail captured %ux%u", g_state.thumbW, g_state.thumbH);
+			const uint32_t w = static_cast<uint32_t>(buf.GetStride());
+			const uint32_t h = static_cast<uint32_t>(buf.GetHeight());
+			const size_t size = static_cast<size_t>(w) * h * 4;
+			g_state.thumbMemory.resize(size);
+			const uint8_t *src = buf.GetData();
+			if (buf.GetFormat() == GPU_DBG_FORMAT_8888_BGRA) {
+				// BGRA -> RGBA so the PNG writer can store it directly.
+				for (size_t i = 0; i < size; i += 4) {
+					g_state.thumbMemory[i] = src[i + 2];
+					g_state.thumbMemory[i + 1] = src[i + 1];
+					g_state.thumbMemory[i + 2] = src[i];
+					g_state.thumbMemory[i + 3] = src[i + 3];
+				}
+			} else {
+				std::memcpy(g_state.thumbMemory.data(), src, size);
+			}
+			g_state.thumbW = w;
+			g_state.thumbH = h;
+			Log("GBAStation menu thumbnail captured %ux%u", w, h);
 		}
 		g_state.menuPendingThumb = false;
 		// Skip the menu this frame so the captured backbuffer stays pure

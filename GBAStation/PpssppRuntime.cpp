@@ -1174,8 +1174,15 @@ void WriteStateThumbnail(const std::string &statePath) {
 	raw.reserve(static_cast<size_t>(w) * (h + 1) * 3 / 2);
 	for (uint32_t y = 0; y < h; ++y) {
 		raw.push_back(0); // filter: None
-		raw.insert(raw.end(), g_state.thumbMemory.begin() + static_cast<ptrdiff_t>(y) * w * 4,
-			g_state.thumbMemory.begin() + static_cast<ptrdiff_t>(y + 1) * w * 4);
+		// Force opaque alpha: the swapchain readback alpha may be 0.
+		const uint8_t *row = g_state.thumbMemory.data() + static_cast<size_t>(y) * w * 4;
+		for (uint32_t x = 0; x < w; ++x) {
+			const uint8_t *p = row + static_cast<size_t>(x) * 4;
+			raw.push_back(p[0]);
+			raw.push_back(p[1]);
+			raw.push_back(p[2]);
+			raw.push_back(255);
+		}
 	}
 
 	uLongf compressedSize = compressBound(static_cast<uLong>(raw.size()));

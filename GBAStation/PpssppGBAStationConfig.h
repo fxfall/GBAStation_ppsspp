@@ -61,6 +61,8 @@ bool GetPspFastForwardToggleMode();
 void SetPspFastForwardToggleMode(bool toggleMode);
 // HUD state.
 double GetPspCurrentFps();
+// Save-state file path for a slot (thumbnail = path + ".png").
+std::string GetPspSaveStatePath(int slot);
 bool GetPspFastForwardActive();
 bool GetPspShowFps();
 

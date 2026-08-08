@@ -5,6 +5,7 @@
 #include "GBAStationRetroAchievements.h"
 #include "GBAStationTranslationManager.h"
 #include "GBAStationUtils.h"
+#include <sys/stat.h>
 #include "Core/Config.h"
 #include "Common/GPU/thin3d.h"
 #include "Common/Math/lin/matrix4x4.h"
@@ -376,6 +377,7 @@ void MoveCheatSelectionWrapped(int &selection, const std::vector<CheatMenuEntry>
 }  // namespace
 
 bool Overlay::Init(Draw::DrawContext *draw, const char *gamePath, LogCallback log) {
+	draw_ = draw;
 	if (log) {
 		log_ = std::move(log);
 	}
@@ -538,7 +540,7 @@ void Overlay::LoadFocusTexture(Draw::DrawContext *draw) {
 		if (!ReadFileBytes(path, &pngData)) {
 			continue;
 		}
-		Draw::Texture *texture = CreateTextureFromFileData(draw, pngData.data(), pngData.size(),
+		Draw::Texture *texture = CreateTextureFromFileData(draw_, pngData.data(), pngData.size(),
 			ImageFileType::PNG, false, path);
 		if (texture) {
 			focusTexture_ = texture;
@@ -613,6 +615,12 @@ void Overlay::Shutdown() {
 	}
 	ReleaseRAIconTexture();
 	ReleaseFocusTexture();
+	for (SlotThumb &thumb : slotThumbs_) {
+		if (thumb.tex) {
+			thumb.tex->Release();
+			thumb.tex = nullptr;
+		}
+	}
 	if (ready_) {
 		ImGui_ImplThin3d_Shutdown();
 	}
@@ -1376,7 +1384,7 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 				} else {
 					drawList->AddRect(cellMin, cellMax, rowBorder, 8.0f * scale, 0, 1.0f * scale);
 				}
-				// Snapshot thumbnail on the left (screenshots land here later).
+				// Snapshot thumbnail on the left (PNG next to the state file).
 				const float snapX = x + 8.0f * scale;
 				const float snapW = cellW * 0.40f - 8.0f * scale;
 				const float snapY = y + 8.0f * scale;
@@ -1385,13 +1393,43 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 					IM_COL32(255, 255, 255, focused ? 18 : 10), 6.0f * scale);
 				drawList->AddRect(ImVec2(snapX, snapY), ImVec2(snapX + snapW, snapY + snapH),
 					IM_COL32(255, 255, 255, focused ? 60 : 34), 6.0f * scale, 0, 1.0f * scale);
-				char snapIcon[8];
-				EncodeUtf8(snapIcon, 0xE413);
-				const float snapIconSize = 30.0f * scale;
-				drawList->AddText(font, snapIconSize,
-					ImVec2(snapX + snapW * 0.5f - snapIconSize * 0.5f,
-						snapY + snapH * 0.5f - snapIconSize * 0.43f),
-					IM_COL32(160, 200, 230, (int)(110.0f * ease)), snapIcon);
+				Draw::Texture *thumbTex = nullptr;
+				if (slotInUse_[slot]) {
+					// Load / refresh the thumbnail when the state file changed.
+					const std::string thumbPath = GetPspSaveStatePath(slot) + ".png";
+					struct stat tst {};
+					if (stat(thumbPath.c_str(), &tst) == 0) {
+						SlotThumb &thumb = slotThumbs_[slot];
+						if (thumb.tex == nullptr || thumb.mtime != tst.st_mtime) {
+							if (thumb.tex) {
+								thumb.tex->Release();
+								thumb.tex = nullptr;
+							}
+							std::vector<unsigned char> pngData;
+							if (ReadFileBytes(thumbPath.c_str(), &pngData) && !pngData.empty()) {
+								thumb.tex = CreateTextureFromFileData(draw_, pngData.data(), pngData.size(),
+									ImageFileType::PNG, false, thumbPath.c_str());
+								thumb.mtime = tst.st_mtime;
+							}
+						}
+						thumbTex = thumb.tex;
+					}
+				} else if (slotThumbs_[slot].tex) {
+					slotThumbs_[slot].tex->Release();
+					slotThumbs_[slot].tex = nullptr;
+				}
+				if (thumbTex) {
+					const ImTextureID texId = ImGui_ImplThin3d_AddTextureTemp(thumbTex);
+					drawList->AddImage(texId, ImVec2(snapX, snapY), ImVec2(snapX + snapW, snapY + snapH));
+				} else {
+					char snapIcon[8];
+					EncodeUtf8(snapIcon, 0xE413);
+					const float snapIconSize = 30.0f * scale;
+					drawList->AddText(font, snapIconSize,
+						ImVec2(snapX + snapW * 0.5f - snapIconSize * 0.5f,
+							snapY + snapH * 0.5f - snapIconSize * 0.43f),
+						IM_COL32(160, 200, 230, (int)(110.0f * ease)), snapIcon);
+				}
 				// Right side: slot name + save time.
 				const float textX = snapX + snapW + 12.0f * scale;
 				const std::string title = tr("存档槽 ") + std::to_string(slot + 1);

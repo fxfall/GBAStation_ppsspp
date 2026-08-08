@@ -45,6 +45,7 @@
 #include "Core/HW/StereoResampler.h"
 #include "Core/MemMapHelpers.h"
 #include "Core/SaveState.h"
+#include "Core/Screenshot.h"
 #include "Core/System.h"
 #include "Core/Util/PathUtil.h"
 #include "GPU/GPUCommon.h"
@@ -131,6 +132,9 @@ struct RuntimeState {
 	bool fastForwardToggle = false;
 	bool fastForwardToggleMode = false;
 	float fastForwardMultiplier = 2.0f;
+	// State thumbnail: captured two frames after the menu closes (pure gameplay).
+	std::string stateThumbPending;
+	int stateThumbDelay = 0;
 	bool fastForwardActive = false;
 	// FPS counter for the HUD.
 	double fps = 60.0;
@@ -1297,6 +1301,10 @@ void ExecuteOverlayCommand(OverlayCommand command) {
 	if (command.action == OverlayAction::SaveState) {
 		Log("GBAStation save state slot=%d path=%s", slot, statePathString.c_str());
 		SaveState::Save(statePath, slot, &AfterSaveStateAction);
+		// Close the menu and snapshot the pure gameplay frame after 2 frames.
+		g_state.stateThumbPending = statePathString;
+		g_state.stateThumbDelay = 2;
+		g_state.overlay.SetVisible(false);
 	} else if (command.action == OverlayAction::LoadState) {
 		if (!File::Exists(statePath)) {
 			Log("GBAStation load state missing slot=%d path=%s", slot, statePathString.c_str());
@@ -1309,6 +1317,12 @@ void ExecuteOverlayCommand(OverlayCommand command) {
 }
 
 }  // namespace
+
+std::string GetPspSaveStatePath(int slot) {
+	const int safeSlot = std::clamp(slot, 0, Ppsspp::SaveStateSlotCount - 1);
+	return GetLegacySaveStatePath(safeSlot).ToString();
+}
+
 // Rewrite a single key in config.cfg (keeping the launcher's "s|" prefix).
 static void WriteConfigValue(const char *key, const std::string &value) {
 	const char *paths[] = {"sdmc:/GBAStation/config/config.cfg", "/GBAStation/config/config.cfg"};
@@ -1676,6 +1690,17 @@ void PpssppRuntime::RenderFrame() {
 	g_state.frameOpen = false;
 	g_frameTiming.PostSubmit();
 	g_state.draw->Present(Draw::PresentMode::FIFO);
+
+	// State thumbnail: wait two frames after the menu closed, then capture the
+	// presented (pure gameplay) frame to a PNG next to the state file.
+	if (!g_state.stateThumbPending.empty()) {
+		if (--g_state.stateThumbDelay <= 0) {
+			ScheduleScreenshot(Path(g_state.stateThumbPending + ".png"), ScreenshotFormat::PNG,
+				ScreenshotType::Output, 720, nullptr);
+			ScreenshotNotifyEndOfFrame(g_state.draw);
+			g_state.stateThumbPending.clear();
+		}
+	}
 }
 
 bool PpssppRuntime::ShouldExit() const {

@@ -1686,6 +1686,7 @@ void PpssppRuntime::RenderFrame() {
 		gpu->CopyDisplayToOutput(displayLayoutConfig);
 	}
 	g_state.overlay.Render(g_state.draw);
+	g_state.overlay.RefreshSlotThumbs(g_state.draw);
 	g_state.draw->EndFrame();
 	g_state.frameOpen = false;
 	g_frameTiming.PostSubmit();
@@ -1695,6 +1696,7 @@ void PpssppRuntime::RenderFrame() {
 	// presented (pure gameplay) frame to a PNG next to the state file.
 	if (!g_state.stateThumbPending.empty()) {
 		if (--g_state.stateThumbDelay <= 0) {
+			Log("GBAStation state thumbnail scheduled for %s.png", g_state.stateThumbPending.c_str());
 			ScheduleScreenshot(Path(g_state.stateThumbPending + ".png"), ScreenshotFormat::PNG,
 				ScreenshotType::Output, 720, nullptr);
 			ScreenshotNotifyEndOfFrame(g_state.draw);

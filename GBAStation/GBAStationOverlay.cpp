@@ -1393,31 +1393,9 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 					IM_COL32(255, 255, 255, focused ? 18 : 10), 6.0f * scale);
 				drawList->AddRect(ImVec2(snapX, snapY), ImVec2(snapX + snapW, snapY + snapH),
 					IM_COL32(255, 255, 255, focused ? 60 : 34), 6.0f * scale, 0, 1.0f * scale);
-				Draw::Texture *thumbTex = nullptr;
-				if (slotInUse_[slot]) {
-					// Load / refresh the thumbnail when the state file changed.
-					const std::string thumbPath = GetPspSaveStatePath(slot) + ".png";
-					struct stat tst {};
-					if (stat(thumbPath.c_str(), &tst) == 0) {
-						SlotThumb &thumb = slotThumbs_[slot];
-						if (thumb.tex == nullptr || thumb.mtime != tst.st_mtime) {
-							if (thumb.tex) {
-								thumb.tex->Release();
-								thumb.tex = nullptr;
-							}
-							std::vector<unsigned char> pngData;
-							if (ReadFileBytes(thumbPath.c_str(), &pngData) && !pngData.empty()) {
-								thumb.tex = CreateTextureFromFileData(draw_, pngData.data(), pngData.size(),
-									ImageFileType::PNG, false, thumbPath.c_str());
-								thumb.mtime = tst.st_mtime;
-							}
-						}
-						thumbTex = thumb.tex;
-					}
-				} else if (slotThumbs_[slot].tex) {
-					slotThumbs_[slot].tex->Release();
-					slotThumbs_[slot].tex = nullptr;
-				}
+				// Thumbnail textures are loaded outside the render frame by
+				// RefreshSlotThumbs(); here we only draw the cached texture.
+				Draw::Texture *thumbTex = slotInUse_[slot] ? slotThumbs_[slot].tex : nullptr;
 				if (thumbTex) {
 					const ImTextureID texId = ImGui_ImplThin3d_AddTextureTemp(thumbTex);
 					drawList->AddImage(texId, ImVec2(snapX, snapY), ImVec2(snapX + snapW, snapY + snapH));
@@ -1690,6 +1668,34 @@ void Overlay::DrawRAAlerts(Draw::DrawContext *draw, ImDrawList *drawList, ImVec2
 		drawList->AddText(descriptionFont, descriptionSize, ImVec2(textX, descriptionY), descriptionColor,
 			description.c_str(), nullptr, maxTextWidth);
 		visibleIndex++;
+	}
+}
+
+void Overlay::RefreshSlotThumbs(Draw::DrawContext *draw) {
+	if (!draw) {
+		return;
+	}
+	for (int slot = 0; slot < Ppsspp::SaveStateSlotCount; ++slot) {
+		SlotThumb &thumb = slotThumbs_[slot];
+		const std::string thumbPath = GetPspSaveStatePath(slot) + ".png";
+		struct stat tst {};
+		if (stat(thumbPath.c_str(), &tst) == 0) {
+			if (thumb.tex == nullptr || thumb.mtime != tst.st_mtime) {
+				if (thumb.tex) {
+					thumb.tex->Release();
+					thumb.tex = nullptr;
+				}
+				std::vector<unsigned char> pngData;
+				if (ReadFileBytes(thumbPath.c_str(), &pngData) && !pngData.empty()) {
+					thumb.tex = CreateTextureFromFileData(draw, pngData.data(), pngData.size(),
+						ImageFileType::PNG, false, thumbPath.c_str());
+					thumb.mtime = tst.st_mtime;
+				}
+			}
+		} else if (thumb.tex) {
+			thumb.tex->Release();
+			thumb.tex = nullptr;
+		}
 	}
 }
 

@@ -61,6 +61,9 @@ public:
 	bool HandleInput(u64 buttons, u64 pressed, int leftStickX, int leftStickY, int rightStickX, int rightStickY,
 		bool menuTogglePressed);
 	void Render(Draw::DrawContext *draw);
+	// Load/refresh slot thumbnail textures outside the render frame (thin3d
+	// texture creation must not happen mid-ImGui-frame).
+	void RefreshSlotThumbs(Draw::DrawContext *draw);
 	void SetSaveStateInfo(int currentSlot, const std::array<bool, Ppsspp::SaveStateSlotCount> &slotInUse,
 		const std::array<time_t, Ppsspp::SaveStateSlotCount> &slotMtime = {});
 	void SetCheatsEnabled(bool enabled);

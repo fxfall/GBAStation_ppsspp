@@ -1675,9 +1675,8 @@ void Overlay::DrawHud(ImDrawList *drawList, float width, float height) {
 
 	std::string text;
 	if (showFps) {
-		char buf[16];
-		const int fps = std::clamp(static_cast<int>(std::lround(GetPspCurrentFps())), 0, 999);
-		std::snprintf(buf, sizeof(buf), "FPS %d", fps);
+		char buf[24];
+		std::snprintf(buf, sizeof(buf), "FPS: %.1f", GetPspCurrentFps());
 		text = buf;
 	}
 	if (fastForward) {
@@ -1685,7 +1684,7 @@ void Overlay::DrawHud(ImDrawList *drawList, float width, float height) {
 			text += "   ";
 		}
 		char buf[16];
-		std::snprintf(buf, sizeof(buf), "FF %dx", static_cast<int>(GetPspFastForwardMultiplier()));
+		std::snprintf(buf, sizeof(buf), "%dx>>", static_cast<int>(GetPspFastForwardMultiplier()));
 		text += buf;
 	}
 

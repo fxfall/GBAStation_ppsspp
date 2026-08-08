@@ -1647,6 +1647,10 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 		PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
 		if (g_state.pspInputSuppressFrames > 0) {
 			--g_state.pspInputSuppressFrames;
+			// Renew while the confirm/back button is still held so the release
+			// does not bleed into the game.
+			if (input.buttons & (HidNpadButton_B | HidNpadButton_A))
+				g_state.pspInputSuppressFrames = 3;
 		}
 	} else {
 		UpdatePspInput(input);

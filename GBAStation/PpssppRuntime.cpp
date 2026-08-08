@@ -1685,14 +1685,10 @@ void PpssppRuntime::RenderFrame() {
 		g_state.draw->BindFramebufferAsRenderTarget(nullptr, { Draw::RPAction::CLEAR, Draw::RPAction::CLEAR, Draw::RPAction::CLEAR }, "GBAStationPpsspp");
 		gpu->CopyDisplayToOutput(displayLayoutConfig);
 	}
-	g_state.overlay.Render(g_state.draw);
-	g_state.overlay.RefreshSlotThumbs(g_state.draw);
-	g_state.draw->EndFrame();
-	g_state.frameOpen = false;
-	g_frameTiming.PostSubmit();
 
 	// State thumbnail: wait two frames after the menu closed, then capture the
-	// (pure gameplay) backbuffer while it is still valid — BEFORE Present.
+	// pure gameplay backbuffer right after the game image is composited and
+	// before the overlay/HUD is drawn (the backbuffer is valid and clean here).
 	if (!g_state.stateThumbPending.empty()) {
 		if (--g_state.stateThumbDelay <= 0) {
 			Log("GBAStation state thumbnail scheduled for %s.png", g_state.stateThumbPending.c_str());
@@ -1703,6 +1699,11 @@ void PpssppRuntime::RenderFrame() {
 		}
 	}
 
+	g_state.overlay.Render(g_state.draw);
+	g_state.overlay.RefreshSlotThumbs(g_state.draw);
+	g_state.draw->EndFrame();
+	g_state.frameOpen = false;
+	g_frameTiming.PostSubmit();
 	g_state.draw->Present(Draw::PresentMode::FIFO);
 }
 

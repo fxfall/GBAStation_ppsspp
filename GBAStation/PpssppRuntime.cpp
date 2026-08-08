@@ -1690,10 +1690,9 @@ void PpssppRuntime::RenderFrame() {
 	g_state.draw->EndFrame();
 	g_state.frameOpen = false;
 	g_frameTiming.PostSubmit();
-	g_state.draw->Present(Draw::PresentMode::FIFO);
 
 	// State thumbnail: wait two frames after the menu closed, then capture the
-	// presented (pure gameplay) frame to a PNG next to the state file.
+	// (pure gameplay) backbuffer while it is still valid — BEFORE Present.
 	if (!g_state.stateThumbPending.empty()) {
 		if (--g_state.stateThumbDelay <= 0) {
 			Log("GBAStation state thumbnail scheduled for %s.png", g_state.stateThumbPending.c_str());
@@ -1703,6 +1702,8 @@ void PpssppRuntime::RenderFrame() {
 			g_state.stateThumbPending.clear();
 		}
 	}
+
+	g_state.draw->Present(Draw::PresentMode::FIFO);
 }
 
 bool PpssppRuntime::ShouldExit() const {

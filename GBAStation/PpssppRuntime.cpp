@@ -464,10 +464,8 @@ void UpdatePspInput(const FrameInput &input) {
 	if (BindingHeld("psp.handle.select", "PAD_BACK", buttons)) currentButtons |= CTRL_SELECT;
 	if (BindingHeld("psp.handle.l", "PAD_LB", buttons)) currentButtons |= CTRL_LTRIGGER;
 	if (BindingHeld("psp.handle.r", "PAD_RB", buttons)) currentButtons |= CTRL_RTRIGGER;
-	if (BindingHeld("psp.handle.l2", "PAD_LT", buttons)) currentButtons |= CTRL_L2;
-	if (BindingHeld("psp.handle.r2", "PAD_RT", buttons)) currentButtons |= CTRL_R2;
-	if (BindingHeld("psp.handle.l3", "PAD_LSB", buttons)) currentButtons |= CTRL_L3;
-	if (BindingHeld("psp.handle.r3", "PAD_RSB", buttons)) currentButtons |= CTRL_R3;
+	// The PSP has no L2/R2/L3/R3 inputs; those button bindings were copied
+	// from another core and must not be parsed.
 	AddRightStickFaceButtons(input, &currentButtons);
 
 	__CtrlUpdateButtons(currentButtons & ~g_state.lastPspButtons, g_state.lastPspButtons & ~currentButtons);

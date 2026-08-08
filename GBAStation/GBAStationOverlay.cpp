@@ -788,7 +788,7 @@ int Overlay::ItemCount() const {
 	if (menu_ == Menu::Cheats) {
 		return std::max(1, (int)cheats_.size());
 	}
-	return coreSettingsPage_ ? 9 : 3;
+	return coreSettingsPage_ ? 5 : 9;
 }
 
 void Overlay::ApplyDisplaySettings(bool save) {
@@ -805,17 +805,12 @@ void Overlay::CycleSetting(int direction) {
 	}
 
 	if (coreSettingsPage_) {
+		// 功能设置: 非画面项目（快速内存/硬件变换/跳缓冲 + 快进）。
 		switch (settingsSelection_) {
-		case 0: g_Config.iFrameSkip = (g_Config.iFrameSkip + direction + 6) % 6; break;
-		case 1: g_Config.bAutoFrameSkip = !g_Config.bAutoFrameSkip; break;
-		case 2: g_Config.bFastMemory = !g_Config.bFastMemory; break;
-		case 3: g_Config.bHardwareTransform = !g_Config.bHardwareTransform; break;
-		case 4: g_Config.bSkipBufferEffects = !g_Config.bSkipBufferEffects; break;
-		case 5: g_Config.bVSync = !g_Config.bVSync; break;
-		case 6: g_Config.iTexFiltering = g_Config.iTexFiltering >= 4 ? 1 : g_Config.iTexFiltering + 1; break;
-		case 7: g_Config.iAnisotropyLevel = (g_Config.iAnisotropyLevel + direction + 5) % 5; break;
-		case 8: g_Config.bTexDeposterize = !g_Config.bTexDeposterize; break;
-		case 9: {
+		case 0: g_Config.bFastMemory = !g_Config.bFastMemory; break;
+		case 1: g_Config.bHardwareTransform = !g_Config.bHardwareTransform; break;
+		case 2: g_Config.bSkipBufferEffects = !g_Config.bSkipBufferEffects; break;
+		case 3: {
 			static const float kMultipliers[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
 			constexpr int kCount = 5;
 			float cur = GetPspFastForwardMultiplier();
@@ -827,7 +822,7 @@ void Overlay::CycleSetting(int direction) {
 			SetPspFastForwardMultiplier(kMultipliers[idx]);
 			break;
 		}
-		case 10:
+		case 4:
 			SetPspFastForwardToggleMode(!GetPspFastForwardToggleMode());
 			break;
 		default: break;
@@ -835,18 +830,21 @@ void Overlay::CycleSetting(int direction) {
 		coreSettingsChanged_ = true;
 		return;
 	}
-	// 画面设置 page: 渲染分辨率 (core setting, needs render resize), then
-	// display mode / size.
+	// 画面设置 page: 渲染分辨率 + 显示模式/比例 + 画面相关核心项。
 	if (settingsSelection_ == 0) {
 		g_Config.iInternalResolution = std::clamp(g_Config.iInternalResolution + direction, 0, 5);
 		coreSettingsChanged_ = true;
 		return;
 	}
-	displaySettings_ = NormalizePpssppDisplaySettingsForCurrentMode(displaySettings_);
 	if (settingsSelection_ == 1) {
+		displaySettings_ = NormalizePpssppDisplaySettingsForCurrentMode(displaySettings_);
 		displaySettings_.mode = displaySettings_.mode == DisplayMode::Integer ? DisplayMode::Display : DisplayMode::Integer;
 		displaySettings_.size = displaySettings_.mode == DisplayMode::Integer ? DisplaySize::Auto : DisplaySize::_16_9;
-	} else {
+		ApplyDisplaySettings(true);
+		return;
+	}
+	if (settingsSelection_ == 2) {
+		displaySettings_ = NormalizePpssppDisplaySettingsForCurrentMode(displaySettings_);
 		if (displaySettings_.mode == DisplayMode::Integer) {
 			DisplaySize integerSizes[5];
 			const int integerSizeCount = GetAvailableIntegerDisplaySizes(integerSizes, (int)(sizeof(integerSizes) / sizeof(integerSizes[0])));
@@ -855,8 +853,19 @@ void Overlay::CycleSetting(int direction) {
 			displaySettings_.size = CycleDisplaySize(displaySettings_.size, kAspectDisplaySizes,
 				(int)(sizeof(kAspectDisplaySizes) / sizeof(kAspectDisplaySizes[0])), direction);
 		}
+		ApplyDisplaySettings(true);
+		return;
 	}
-	ApplyDisplaySettings(true);
+	switch (settingsSelection_) {
+	case 3: g_Config.iFrameSkip = (g_Config.iFrameSkip + direction + 6) % 6; break;
+	case 4: g_Config.bAutoFrameSkip = !g_Config.bAutoFrameSkip; break;
+	case 5: g_Config.bVSync = !g_Config.bVSync; break;
+	case 6: g_Config.iTexFiltering = g_Config.iTexFiltering >= 4 ? 1 : g_Config.iTexFiltering + 1; break;
+	case 7: g_Config.iAnisotropyLevel = (g_Config.iAnisotropyLevel + direction + 5) % 5; break;
+	case 8: g_Config.bTexDeposterize = !g_Config.bTexDeposterize; break;
+	default: break;
+	}
+	coreSettingsChanged_ = true;
 }
 
 void Overlay::ExecuteSelection() {
@@ -1427,31 +1436,22 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 	} else if (menu_ == Menu::Settings) {
 		char icon[8];
 		if (coreSettingsPage_) {
+			// 功能设置: 非画面项目。
 			const std::string labels[] = {
-				tr("跳帧"), tr("自动跳帧"), tr("快速内存"), tr("硬件变换"),
-				tr("跳过缓冲区效果"), tr("垂直同步"), tr("纹理过滤"), tr("各向异性过滤"), tr("纹理去色带"),
+				tr("快速内存"), tr("硬件变换"), tr("跳过缓冲区效果"),
 				tr("快进倍率"), tr("快进模式")};
-			const int rowIcons[] = {0xE8B8, 0xE8E5, 0xE896, 0xE3B6, 0xE428, 0xE8F1, 0xE3F4, 0xE3F4, 0xE873, 0xE8B2, 0xE8B8};
+			const int rowIcons[] = {0xE896, 0xE3B6, 0xE428, 0xE8B2, 0xE8B8};
 			auto enabled = [](bool value) { return value ? std::string(tr("开启")) : std::string(tr("关闭")); };
 			auto settingValue = [&](int index) {
 				switch (index) {
-				case 0: return g_Config.iFrameSkip == 0 ? std::string(tr("关闭")) : std::to_string(g_Config.iFrameSkip) + tr(" 帧");
-				case 1: return enabled(g_Config.bAutoFrameSkip);
-				case 2: return enabled(g_Config.bFastMemory);
-				case 3: return enabled(g_Config.bHardwareTransform);
-				case 4: return enabled(g_Config.bSkipBufferEffects);
-				case 5: return enabled(g_Config.bVSync);
-				case 6: {
-					const std::string filters[] = {tr("默认"), tr("自动"), tr("最近邻"), tr("线性"), tr("高质量")};
-					return std::string(filters[std::clamp(g_Config.iTexFiltering, 0, 4)]);
-				}
-				case 7: return g_Config.iAnisotropyLevel == 0 ? std::string(tr("关闭")) : std::to_string(1 << g_Config.iAnisotropyLevel) + "x";
-				case 8: return enabled(g_Config.bTexDeposterize);
-				case 9: return std::to_string(static_cast<int>(GetPspFastForwardMultiplier())) + "x";
+				case 0: return enabled(g_Config.bFastMemory);
+				case 1: return enabled(g_Config.bHardwareTransform);
+				case 2: return enabled(g_Config.bSkipBufferEffects);
+				case 3: return std::to_string(static_cast<int>(GetPspFastForwardMultiplier())) + "x";
 				default: return GetPspFastForwardToggleMode() ? std::string(tr("切换")) : std::string(tr("按住"));
 				}
 			};
-			const int total = 11;
+			const int total = 5;
 			const int visible = std::min(8, total);
 			const int first = std::clamp(selection_ - visible / 2, 0, std::max(0, total - visible));
 			for (int row = 0; row < visible; ++row) {
@@ -1461,22 +1461,35 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 					settingValue(index), true);
 			}
 		} else {
-			// 画面设置: resolution moved here from the core page.
-			const std::string labels[] = {tr("渲染分辨率"), tr("显示模式"), tr("画面比例")};
-			const int rowIcons[] = {0xE333, 0xE8F1, 0xE3F4};
+			// 画面设置: 分辨率/显示模式/比例 + 画面相关核心项。
+			const std::string labels[] = {tr("渲染分辨率"), tr("显示模式"), tr("画面比例"),
+				tr("跳帧"), tr("自动跳帧"), tr("垂直同步"), tr("纹理过滤"), tr("各向异性过滤"), tr("纹理去色带")};
+			const int rowIcons[] = {0xE333, 0xE8F1, 0xE3F4, 0xE8B8, 0xE8E5, 0xE8F1, 0xE3F4, 0xE3F4, 0xE873};
+			auto enabled = [](bool value) { return value ? std::string(tr("开启")) : std::string(tr("关闭")); };
 			auto settingValue = [&](int index) {
-				if (index == 0) {
-					return g_Config.iInternalResolution == 0 ? std::string(tr("自动")) : std::to_string(g_Config.iInternalResolution) + "x";
+				switch (index) {
+				case 0: return g_Config.iInternalResolution == 0 ? std::string(tr("自动")) : std::to_string(g_Config.iInternalResolution) + "x";
+				case 1: return TranslatedDisplayModeLabel(displaySettings_.mode);
+				case 2: return TranslatedDisplaySizeLabel(displaySettings_.size);
+				case 3: return g_Config.iFrameSkip == 0 ? std::string(tr("关闭")) : std::to_string(g_Config.iFrameSkip) + tr(" 帧");
+				case 4: return enabled(g_Config.bAutoFrameSkip);
+				case 5: return enabled(g_Config.bVSync);
+				case 6: {
+					const std::string filters[] = {tr("默认"), tr("自动"), tr("最近邻"), tr("线性"), tr("高质量")};
+					return std::string(filters[std::clamp(g_Config.iTexFiltering, 0, 4)]);
 				}
-				if (index == 1) {
-					return TranslatedDisplayModeLabel(displaySettings_.mode);
+				case 7: return g_Config.iAnisotropyLevel == 0 ? std::string(tr("关闭")) : std::to_string(1 << g_Config.iAnisotropyLevel) + "x";
+				default: return enabled(g_Config.bTexDeposterize);
 				}
-				return TranslatedDisplaySizeLabel(displaySettings_.size);
 			};
-			for (int row = 0; row < 3; ++row) {
-				EncodeUtf8(icon, rowIcons[row]);
-				drawRow(row, inContent && row == selection_, icon, labels[row],
-					settingValue(row), true);
+			const int total = 9;
+			const int visible = std::min(8, total);
+			const int first = std::clamp(selection_ - visible / 2, 0, std::max(0, total - visible));
+			for (int row = 0; row < visible; ++row) {
+				const int index = first + row;
+				EncodeUtf8(icon, rowIcons[index]);
+				drawRow(row, inContent && index == selection_, icon, labels[index],
+					settingValue(index), true);
 			}
 		}
 	} else {

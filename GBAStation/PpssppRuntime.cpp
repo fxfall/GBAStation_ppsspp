@@ -142,6 +142,8 @@ struct RuntimeState {
 	uint32_t thumbW = 0;
 	uint32_t thumbH = 0;
 	bool menuPendingThumb = false;
+	// Frames to suppress game input after the menu closes (button bleed-through).
+	int pspInputSuppressFrames = 0;
 	bool fastForwardActive = false;
 	// FPS counter for the HUD.
 	double fps = 60.0;
@@ -1612,8 +1614,14 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 	const int prevResolution = g_Config.iInternalResolution;
 	const bool prevSkipBufferEffects = g_Config.bSkipBufferEffects;
 	const bool prevFastMemory = g_Config.bFastMemory;
+	const bool wasOverlayVisible = g_state.overlay.IsVisible();
 	const bool inputConsumedByOverlay = g_state.overlay.HandleInput(input.buttons, input.pressed,
 		input.leftStickX, input.leftStickY, input.rightStickX, input.rightStickY, overlayTogglePressed);
+	// The menu just closed: suppress game input for a few frames so the
+	// confirm/back button press does not bleed into the game.
+	if (wasOverlayVisible && !g_state.overlay.IsVisible()) {
+		g_state.pspInputSuppressFrames = 3;
+	}
 	if (g_state.overlay.ConsumeCoreSettingsChanged()) {
 		SaveGBAStationPpssppRuntimeSettings();
 		g_state.runtimeSettingsDirty = true;
@@ -1632,11 +1640,14 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 		return;
 	}
 
-	if (inputConsumedByOverlay) {
+	if (inputConsumedByOverlay || g_state.pspInputSuppressFrames > 0) {
 		ClearPspInput();
 		g_state.fastForwardActive = false;
 		PSP_CoreParameter().fastForward = false;
 		PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
+		if (g_state.pspInputSuppressFrames > 0) {
+			--g_state.pspInputSuppressFrames;
+		}
 	} else {
 		UpdatePspInput(input);
 		const bool ffHeld = BindingHeld(

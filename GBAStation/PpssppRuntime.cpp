@@ -46,6 +46,8 @@
 #include "Core/MemMapHelpers.h"
 #include "Core/SaveState.h"
 #include "Core/Screenshot.h"
+#include "GPU/Common/FramebufferManagerCommon.h"
+#include "Core/Screenshot.h"
 #include "Core/System.h"
 #include "Core/Util/PathUtil.h"
 #include "GPU/GPUCommon.h"
@@ -71,6 +73,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <zlib.h>
 
 namespace GBAStation {
 namespace {
@@ -133,8 +136,12 @@ struct RuntimeState {
 	bool fastForwardToggleMode = false;
 	float fastForwardMultiplier = 2.0f;
 	// State thumbnail: captured two frames after the menu closes (pure gameplay).
-	std::string stateThumbPending;
-	int stateThumbDelay = 0;
+	// Menu-open thumbnail: captured into memory when the menu button is pressed,
+	// written to a PNG next to the state file when a state is saved.
+	std::vector<uint8_t> thumbMemory;
+	uint32_t thumbW = 0;
+	uint32_t thumbH = 0;
+	bool menuPendingThumb = false;
 	bool fastForwardActive = false;
 	// FPS counter for the HUD.
 	double fps = 60.0;
@@ -1150,7 +1157,80 @@ void ToggleCheatFromQuickMenu(int index) {
 	}
 }
 
+
+// Writes the in-memory menu-open thumbnail as a PNG next to the state file.
+void WriteStateThumbnail(const std::string &statePath) {
+	if (g_state.thumbMemory.empty() || g_state.thumbW == 0 || g_state.thumbH == 0) {
+		Log("GBAStation state thumbnail: no captured frame in memory");
+		return;
+	}
+	const uint32_t w = g_state.thumbW;
+	const uint32_t h = g_state.thumbH;
+	const std::string outPath = statePath + ".png";
+
+	std::vector<uint8_t> raw;
+	raw.reserve(static_cast<size_t>(w) * (h + 1) * 3 / 2);
+	for (uint32_t y = 0; y < h; ++y) {
+		raw.push_back(0); // filter: None
+		const uint8_t *row = g_state.thumbMemory.data() + static_cast<size_t>(y) * w * 4;
+		// The Vulkan backbuffer readback is BGRA; convert to RGBA for the PNG.
+		for (uint32_t x = 0; x < w; ++x) {
+			const uint8_t *p = row + static_cast<size_t>(x) * 4;
+			raw.push_back(p[2]); // R
+			raw.push_back(p[1]); // G
+			raw.push_back(p[0]); // B
+			raw.push_back(p[3]); // A
+		}
+	}
+
+	uLongf compressedSize = compressBound(static_cast<uLong>(raw.size()));
+	std::vector<uint8_t> compressed(compressedSize);
+	if (compress2(compressed.data(), &compressedSize, raw.data(), static_cast<uLong>(raw.size()),
+		Z_BEST_SPEED) != Z_OK) {
+		Log("GBAStation state thumbnail: compress failed");
+		return;
+	}
+	compressed.resize(compressedSize);
+
+	FILE *fp = fopen(outPath.c_str(), "wb");
+	if (!fp) {
+		Log("GBAStation state thumbnail: cannot open %s", outPath.c_str());
+		return;
+	}
+	auto writeU32 = [&](uint32_t v) {
+		const uint8_t b[4] = {static_cast<uint8_t>(v >> 24), static_cast<uint8_t>(v >> 16),
+			static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v)};
+		fwrite(b, 1, 4, fp);
+	};
+	auto writeChunk = [&](const char tag[4], const uint8_t *data, uint32_t len) {
+		writeU32(len);
+		fwrite(tag, 1, 4, fp);
+		fwrite(data, 1, len, fp);
+		uint32_t crc = crc32(0, reinterpret_cast<const uint8_t *>(tag), 4);
+		if (len) {
+			crc = crc32(crc, data, len);
+		}
+		writeU32(crc);
+	};
+
+	const uint8_t signature[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+	fwrite(signature, 1, 8, fp);
+
+	uint8_t ihdr[13];
+	ihdr[0] = static_cast<uint8_t>(w >> 24); ihdr[1] = static_cast<uint8_t>(w >> 16);
+	ihdr[2] = static_cast<uint8_t>(w >> 8);  ihdr[3] = static_cast<uint8_t>(w);
+	ihdr[4] = static_cast<uint8_t>(h >> 24); ihdr[5] = static_cast<uint8_t>(h >> 16);
+	ihdr[6] = static_cast<uint8_t>(h >> 8);  ihdr[7] = static_cast<uint8_t>(h);
+	ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+	writeChunk("IHDR", ihdr, sizeof(ihdr));
+	writeChunk("IDAT", compressed.data(), static_cast<uint32_t>(compressed.size()));
+	writeChunk("IEND", nullptr, 0);
+	fclose(fp);
+	Log("GBAStation state thumbnail written %ux%u -> %s", w, h, outPath.c_str());
+}
+
 std::string GetLegacySaveStateBaseName() {
+
 	std::string romName = g_state.contentPath;
 
 	size_t lastSlash = romName.find_last_of("/\\");
@@ -1301,9 +1381,9 @@ void ExecuteOverlayCommand(OverlayCommand command) {
 	if (command.action == OverlayAction::SaveState) {
 		Log("GBAStation save state slot=%d path=%s", slot, statePathString.c_str());
 		SaveState::Save(statePath, slot, &AfterSaveStateAction);
-		// Close the menu and snapshot the pure gameplay frame after 2 frames.
-		g_state.stateThumbPending = statePathString;
-		g_state.stateThumbDelay = 2;
+		// Write the menu-open thumbnail (captured into memory before the menu
+		// rendered) next to the state file.
+		WriteStateThumbnail(statePathString);
 		g_state.overlay.SetVisible(false);
 	} else if (command.action == OverlayAction::LoadState) {
 		if (!File::Exists(statePath)) {
@@ -1323,6 +1403,7 @@ std::string GetPspSaveStatePath(int slot) {
 	return GetLegacySaveStatePath(safeSlot).ToString();
 }
 
+// Rewrite a single key in config.cfg (keeping the launcher's "s|" prefix).
 // Rewrite a single key in config.cfg (keeping the launcher's "s|" prefix).
 static void WriteConfigValue(const char *key, const std::string &value) {
 	const char *paths[] = {"sdmc:/GBAStation/config/config.cfg", "/GBAStation/config/config.cfg"};
@@ -1521,6 +1602,11 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 		"psp.hotkey.menu.pad", "PAD_LT+PAD_RT", input.buttons, input.pressed);
 	const bool overlayToggleHeld = BindingHeld(
 		"psp.hotkey.menu.pad", "PAD_LT+PAD_RT", input.buttons);
+	if (overlayTogglePressed) {
+		// Capture the pure gameplay frame into memory before the menu renders;
+		// used as the state thumbnail when a state is saved.
+		g_state.menuPendingThumb = true;
+	}
 	if (g_state.overlay.IsVisible() || overlayTogglePressed) {
 		RefreshSaveStateSlots(overlayTogglePressed);
 		if (overlayTogglePressed) {
@@ -1686,17 +1772,28 @@ void PpssppRuntime::RenderFrame() {
 		gpu->CopyDisplayToOutput(displayLayoutConfig);
 	}
 
-	// State thumbnail: wait two frames after the menu closed, then capture the
-	// pure gameplay backbuffer right after the game image is composited and
-	// before the overlay/HUD is drawn (the backbuffer is valid and clean here).
-	if (!g_state.stateThumbPending.empty()) {
-		if (--g_state.stateThumbDelay <= 0) {
-			Log("GBAStation state thumbnail scheduled for %s.png", g_state.stateThumbPending.c_str());
-			ScheduleScreenshot(Path(g_state.stateThumbPending + ".png"), ScreenshotFormat::PNG,
-				ScreenshotType::Output, 720, nullptr);
-			ScreenshotNotifyEndOfFrame(g_state.draw);
-			g_state.stateThumbPending.clear();
+	// Menu-open thumbnail: when the menu button was just pressed, capture the
+	// pure gameplay backbuffer (game image already composited, menu not yet
+	// drawn) into memory. The BLOCK readback submits the game + readback steps
+	// in a single flush (the same pattern ppsspp uses for AVI recording), so
+	// this is safe; the menu is delayed one frame to keep the frame clean.
+	if (g_state.menuPendingThumb) {
+		GPUDebugBuffer buf;
+		if (::GetOutputFramebuffer(g_state.draw, buf)) {
+			g_state.thumbW = static_cast<uint32_t>(buf.GetStride());
+			g_state.thumbH = static_cast<uint32_t>(buf.GetHeight());
+			const size_t size = static_cast<size_t>(g_state.thumbW) * g_state.thumbH * 4;
+			g_state.thumbMemory.assign(buf.GetData(), buf.GetData() + size);
+			Log("GBAStation menu thumbnail captured %ux%u", g_state.thumbW, g_state.thumbH);
 		}
+		g_state.menuPendingThumb = false;
+		// Skip the menu this frame so the captured backbuffer stays pure
+		// gameplay; it will be shown on the next frame.
+		g_state.draw->EndFrame();
+		g_state.frameOpen = false;
+		g_frameTiming.PostSubmit();
+		g_state.draw->Present(Draw::PresentMode::FIFO);
+		return;
 	}
 
 	g_state.overlay.Render(g_state.draw);

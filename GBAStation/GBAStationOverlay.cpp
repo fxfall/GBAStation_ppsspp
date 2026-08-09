@@ -983,7 +983,11 @@ bool Overlay::HandleInput(u64 buttons, u64 pressed, int leftStickX, int leftStic
 			dpadNavDir_ = 0;
 			nextDPadNavMs_ = 0;
 		}
-		if (menu_ == Menu::Cheats) {
+		// The cheat-list repeat handling fires immediately for a newly held
+		// direction.  Do not apply it while the sidebar still has focus: when
+		// moving between tabs, that immediate repeat would move past the Cheats
+		// tab in the same direction.
+		if (menu_ == Menu::Cheats && !sidebarFocused_) {
 			navUp = false;
 			navDown = false;
 			navLeft = false;
@@ -1194,11 +1198,15 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 	const ImU32 white = IM_COL32(240, 247, 255, (int)(255.0f * ease));
 	const ImU32 muted = IM_COL32(184, 204, 224, (int)(199.0f * ease));
 	const ImU32 cyan = IM_COL32(112, 204, 255, (int)(255.0f * ease));
-	const ImU32 focusBg = IM_COL32(0, 77, 128, (int)(133.0f * ease));
-	const ImU32 contentFocusBg = IM_COL32(33, 107, 179, (int)(51.0f * ease));
-	const ImU32 rowBg = IM_COL32(255, 255, 255, (int)(11.0f * ease));
-	const ImU32 rowBorder = IM_COL32(255, 255, 255, (int)(26.0f * ease));
-	const ImU32 focusBorder = IM_COL32(79, 179, 255, (int)(128.0f * ease));
+	const ImU32 focusBg = IM_COL32(0, 88, 143, (int)(172.0f * ease));
+	const ImU32 contentFocusBg = IM_COL32(27, 96, 153, (int)(84.0f * ease));
+	// Keep each interactive row visually self-contained.  The original 3DS
+	// shell was deliberately subtle, but its almost-transparent row borders
+	// made settings pages read as plain text rather than controls.
+	const ImU32 rowBg = IM_COL32(17, 31, 43, (int)(142.0f * ease));
+	const ImU32 rowBorder = IM_COL32(121, 165, 193, (int)(102.0f * ease));
+	const ImU32 rowHighlight = IM_COL32(213, 242, 255, (int)(42.0f * ease));
+	const ImU32 focusBorder = IM_COL32(81, 201, 255, (int)(220.0f * ease));
 
 	ImFont *font = ImGui::GetFont();
 	const float fontSize = ImGui::GetFontSize();
@@ -1264,8 +1272,8 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 	const float viewTop = 176.0f * scale;
 	const float viewBottom = 664.0f * scale;
 	const float targetCenter = 420.0f * scale;
-	const float rowH = 48.0f * scale;
-	const float rowGap = 4.0f * scale;
+	const float rowH = 50.0f * scale;
+	const float rowGap = 7.0f * scale;
 
 	// Header + title underline
 	drawList->AddText(font, 27.0f * scale, ImVec2(contentX, 116.0f * scale), white, tabs[active].c_str());
@@ -1281,11 +1289,17 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 		}
 		const ImVec2 rowMin(contentX, y), rowMax(contentX + contentW, y + rowH);
 		drawList->AddRectFilled(rowMin, rowMax, focused ? focusBg : rowBg);
+		// A restrained top sheen and leading accent make the outlined settings
+		// rows feel like controls without competing with their labels.
+		drawList->AddLine(ImVec2(rowMin.x + 1.0f * scale, rowMin.y + 1.0f * scale),
+			ImVec2(rowMax.x - 1.0f * scale, rowMin.y + 1.0f * scale), rowHighlight, 1.0f * scale);
+		drawList->AddRectFilled(rowMin, ImVec2(rowMin.x + (focused ? 4.0f : 2.0f) * scale, rowMax.y),
+			focused ? cyan : IM_COL32(91, 163, 201, (int)(100.0f * ease)));
 		if (focused) {
 			if (focusTexture_) {
 				DrawFlowBorder(drawList, contentX, y, contentW, rowH, 3.0f * scale);
 			} else {
-				drawList->AddRect(rowMin, rowMax, IM_COL32(79, 179, 255, (int)(255.0f * ease)));
+				drawList->AddRect(rowMin, rowMax, focusBorder, 0.0f, 0, 2.0f * scale);
 			}
 		} else {
 			drawList->AddRect(rowMin, rowMax, rowBorder, 0.0f, 0, 1.0f * scale);
@@ -1374,15 +1388,19 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 				}
 				const bool focused = inContent && slot == selection_;
 				const ImVec2 cellMin(x, y), cellMax(x + cellW, y + cellH);
-				drawList->AddRectFilled(cellMin, cellMax, focused ? focusBg : rowBg, 8.0f * scale);
+				drawList->AddRectFilled(cellMin, cellMax, focused ? focusBg : rowBg, 4.0f * scale);
+				drawList->AddLine(ImVec2(cellMin.x + 1.0f * scale, cellMin.y + 1.0f * scale),
+					ImVec2(cellMax.x - 1.0f * scale, cellMin.y + 1.0f * scale), rowHighlight, 1.0f * scale);
+				drawList->AddRectFilled(cellMin, ImVec2(cellMin.x + (focused ? 4.0f : 2.0f) * scale, cellMax.y),
+					focused ? cyan : IM_COL32(91, 163, 201, (int)(100.0f * ease)), 4.0f * scale);
 				if (focused) {
 					if (focusTexture_) {
 						DrawFlowBorder(drawList, x, y, cellW, cellH, 3.0f * scale);
 					} else {
-						drawList->AddRect(cellMin, cellMax, IM_COL32(79, 179, 255, (int)(255.0f * ease)), 0.0f, 0, 2.0f * scale);
+						drawList->AddRect(cellMin, cellMax, focusBorder, 4.0f * scale, 0, 2.0f * scale);
 					}
 				} else {
-					drawList->AddRect(cellMin, cellMax, rowBorder, 8.0f * scale, 0, 1.0f * scale);
+					drawList->AddRect(cellMin, cellMax, rowBorder, 4.0f * scale, 0, 1.0f * scale);
 				}
 				// Snapshot thumbnail on the left (PNG next to the state file).
 				const float snapX = x + 8.0f * scale;
@@ -1439,7 +1457,7 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 			drawList->AddText(font, 21.0f * scale, ImVec2(contentX, viewTop + 28.0f * scale), muted, tr("当前游戏没有可用金手指。").c_str());
 			drawList->AddText(font, 20.0f * scale, ImVec2(contentX, viewTop + 100.0f * scale), muted, tr("已加载的金手指会在这里显示").c_str());
 		} else {
-			const int visible = std::min(9, (int)cheats_.size());
+			const int visible = std::min(8, (int)cheats_.size());
 			const int first = std::clamp(selection_ - visible / 2, 0, std::max(0, (int)cheats_.size() - visible));
 			for (int row = 0; row < visible; ++row) {
 				const int index = first + row;

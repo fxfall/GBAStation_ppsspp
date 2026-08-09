@@ -95,7 +95,6 @@ constexpr int kAudioThreadCore = 1;
 constexpr size_t kCheatLoadThreadStackSize = 0x20000;
 constexpr int kCheatLoadThreadPriority = 0x3B;
 constexpr int kCheatLoadThreadCore = -2;
-constexpr int kRightStickFaceButtonThreshold = 12000;
 constexpr size_t kCheatMetadataLineChars = 68;
 
 struct RuntimeState {
@@ -456,24 +455,6 @@ void ApplyGBAStationPpssppDisplaySettings(DisplaySettings &settings) {
 		size.empty() ? "(core-config)" : size.c_str());
 }
 
-void AddRightStickFaceButtons(const FrameInput &input, u32 *buttons) {
-	if (!buttons) {
-		return;
-	}
-	if (input.rightStickY > kRightStickFaceButtonThreshold) {
-		*buttons |= CTRL_TRIANGLE;
-	}
-	if (input.rightStickY < -kRightStickFaceButtonThreshold) {
-		*buttons |= CTRL_CROSS;
-	}
-	if (input.rightStickX < -kRightStickFaceButtonThreshold) {
-		*buttons |= CTRL_SQUARE;
-	}
-	if (input.rightStickX > kRightStickFaceButtonThreshold) {
-		*buttons |= CTRL_CIRCLE;
-	}
-}
-
 void ClearPspInput() {
 	if (g_state.lastPspButtons != 0) {
 		__CtrlUpdateButtons(0, g_state.lastPspButtons);
@@ -500,8 +481,6 @@ void UpdatePspInput(const FrameInput &input) {
 	if (BindingHeld("psp.handle.r", "PAD_RB", buttons)) currentButtons |= CTRL_RTRIGGER;
 	// The PSP has no L2/R2/L3/R3 inputs; those button bindings were copied
 	// from another core and must not be parsed.
-	AddRightStickFaceButtons(input, &currentButtons);
-
 	__CtrlUpdateButtons(currentButtons & ~g_state.lastPspButtons, g_state.lastPspButtons & ~currentButtons);
 	g_state.lastPspButtons = currentButtons;
 	__CtrlSetAnalogXY(CTRL_STICK_LEFT, NormalizeStickAxis(input.leftStickX), NormalizeStickAxis(input.leftStickY));

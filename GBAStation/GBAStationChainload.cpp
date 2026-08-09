@@ -46,6 +46,11 @@ void SetLauncherReturnPath(const char *path) {
 	}
 }
 
+bool HasLauncherReturnPath() {
+	return !g_returnPath.empty();
+}
+
+
 void SetExternalSessionToken(const char *token) {
 	if (token && token[0]) {
 		g_sessionToken = token;

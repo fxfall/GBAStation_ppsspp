@@ -39,12 +39,16 @@
 #include "Core/CoreTiming.h"
 #include "Core/CwCheat.h"
 #include "Core/ELF/ParamSFO.h"
+#include "Core/ELF/PBPReader.h"
+#include "Core/FileSystems/MetaFileSystem.h"
+#include "Core/Loaders.h"
 #include "Core/FrameTiming.h"
 #include "Core/HLE/sceCtrl.h"
 #include "Core/HLE/sceDisplay.h"
 #include "Core/HW/StereoResampler.h"
 #include "Core/MemMapHelpers.h"
 #include "Core/SaveState.h"
+#include "dep/nlohmann/json.hpp"
 #include "Core/Screenshot.h"
 #include "GPU/Common/FramebufferManagerCommon.h"
 #include "Core/Screenshot.h"
@@ -106,6 +110,23 @@ struct RuntimeState {
 	bool settingsRenderResized = false;
 	bool settingsJitClear = false;
 	std::string contentPath;
+	// Play stats + auto save/load (launcher config.cfg keys).
+	int playCount = 0;
+	int playTimeTotal = 0;
+	bool playStatsFound = false;
+	int sessionPlaySeconds = 0;
+	double playTimeFraction = 0.0;
+	double playTimeLastMs = 0.0;
+	int autoLoadStateSlot = 0;
+	int autoSaveOnExitSlot = 0;
+	std::string savePath; // per-game save dir from the launcher GameDB (savePath field)
+	// Cached GameDB entry (loaded once at boot; title/logo updates mutate it in
+	// memory and a single flush writes it back).
+	nlohmann::json gameDbData;
+	size_t gameDbIndex = 0;
+	bool gameDbLoaded = false;
+	bool gameDbDirty = false;
+	std::string gameDbPath;
 	GBAStationGraphicsHost graphicsHost;
 	GraphicsContext *graphicsContext = nullptr;
 	Draw::DrawContext *draw = nullptr;
@@ -1161,22 +1182,68 @@ void ToggleCheatFromQuickMenu(int index) {
 
 
 // Writes the in-memory menu-open thumbnail as a PNG next to the state file.
+// Bilinear scale an RGBA image so its width is at most kThumbMaxWidth.
+// Thumbnails are menu previews; keeping them small keeps PNGs well under
+// 500 KB even at high internal resolutions.
+void ScaleRgbaForThumb(const uint8_t *src, int sw, int sh, std::vector<uint8_t> &dst, int &dw, int &dh) {
+	const int maxW = 320;
+	if (sw <= maxW) {
+		dst.assign(src, src + static_cast<size_t>(sw) * sh * 4);
+		dw = sw;
+		dh = sh;
+		return;
+	}
+	dw = maxW;
+	dh = std::max(1, static_cast<int>(static_cast<double>(sh) * maxW / sw + 0.5));
+	dst.resize(static_cast<size_t>(dw) * dh * 4);
+	const double sx = static_cast<double>(sw) / dw;
+	const double sy = static_cast<double>(sh) / dh;
+	for (int y = 0; y < dh; ++y) {
+		double fy = (y + 0.5) * sy - 0.5;
+		int y0 = static_cast<int>(fy);
+		if (y0 < 0) y0 = 0;
+		int y1 = y0 + 1;
+		if (y1 >= sh) y1 = sh - 1;
+		const double ty = fy - y0;
+		const uint8_t *row0 = src + static_cast<size_t>(y0) * sw * 4;
+		const uint8_t *row1 = src + static_cast<size_t>(y1) * sw * 4;
+		uint8_t *out = dst.data() + static_cast<size_t>(y) * dw * 4;
+		for (int x = 0; x < dw; ++x) {
+			double fx = (x + 0.5) * sx - 0.5;
+			int x0 = static_cast<int>(fx);
+			if (x0 < 0) x0 = 0;
+			int x1 = x0 + 1;
+			if (x1 >= sw) x1 = sw - 1;
+			const double tx = fx - x0;
+			for (int c = 0; c < 4; ++c) {
+				const double v = (1.0 - tx) * (1.0 - ty) * row0[x0 * 4 + c] +
+				                 tx * (1.0 - ty) * row0[x1 * 4 + c] +
+				                 (1.0 - tx) * ty * row1[x0 * 4 + c] +
+				                 tx * ty * row1[x1 * 4 + c];
+				out[x * 4 + c] = static_cast<uint8_t>(v + 0.5);
+			}
+		}
+	}
+}
+
 void WriteStateThumbnail(const std::string &statePath) {
 	if (g_state.thumbMemory.empty() || g_state.thumbW == 0 || g_state.thumbH == 0) {
 		Log("GBAStation state thumbnail: no captured frame in memory");
 		return;
 	}
-	const uint32_t w = g_state.thumbW;
-	const uint32_t h = g_state.thumbH;
+	// Downscale to a compact thumbnail before encoding.
+	std::vector<uint8_t> scaled;
+	int w = 0, h = 0;
+	ScaleRgbaForThumb(g_state.thumbMemory.data(), g_state.thumbW, g_state.thumbH, scaled, w, h);
 	const std::string outPath = statePath + ".png";
 
 	std::vector<uint8_t> raw;
 	raw.reserve(static_cast<size_t>(w) * (h + 1) * 3 / 2);
-	for (uint32_t y = 0; y < h; ++y) {
+	for (uint32_t y = 0; y < static_cast<uint32_t>(h); ++y) {
 		raw.push_back(0); // filter: None
 		// Force opaque alpha: the swapchain readback alpha may be 0.
-		const uint8_t *row = g_state.thumbMemory.data() + static_cast<size_t>(y) * w * 4;
-		for (uint32_t x = 0; x < w; ++x) {
+		const uint8_t *row = scaled.data() + static_cast<size_t>(y) * w * 4;
+		for (uint32_t x = 0; x < static_cast<uint32_t>(w); ++x) {
 			const uint8_t *p = row + static_cast<size_t>(x) * 4;
 			raw.push_back(p[0]);
 			raw.push_back(p[1]);
@@ -1188,7 +1255,7 @@ void WriteStateThumbnail(const std::string &statePath) {
 	uLongf compressedSize = compressBound(static_cast<uLong>(raw.size()));
 	std::vector<uint8_t> compressed(compressedSize);
 	if (compress2(compressed.data(), &compressedSize, raw.data(), static_cast<uLong>(raw.size()),
-		Z_BEST_SPEED) != Z_OK) {
+		Z_BEST_COMPRESSION) != Z_OK) {
 		Log("GBAStation state thumbnail: compress failed");
 		return;
 	}
@@ -1231,6 +1298,267 @@ void WriteStateThumbnail(const std::string &statePath) {
 	Log("GBAStation state thumbnail written %ux%u -> %s", w, h, outPath.c_str());
 }
 
+// ---- Play stats / GameDB helpers (mirrors nds_stub) ----
+
+std::string NormalizePsRomPath(std::string path) {
+    for (char& ch : path) {
+        if (ch == '\\') ch = '/';
+    }
+    if (path.rfind("sdmc:", 0) == 0) path.erase(0, 5);
+    while (path.size() > 1 && path[0] == '/' && path[1] == '/') path.erase(0, 1);
+    return path;
+}
+
+std::string CurrentPsTimestamp() {
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_r(&now, &local);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%y-%m-%d %H-%M-%S", &local);
+    return buf;
+}
+
+// 启动时一次读入并缓存 GameDB 匹配条目；title/logoPath 的更新直接改缓存，
+// 最后由 FlushPspGameDb 统一写回一次。
+void FlushPspGameDb() {
+    if (!g_state.gameDbLoaded || !g_state.gameDbDirty || g_state.gameDbPath.empty())
+        return;
+    std::ofstream out(g_state.gameDbPath, std::ios::trunc);
+    if (out) {
+        out << g_state.gameDbData.dump(4);
+        Log("GBAStation GameDB flushed %s", g_state.gameDbPath.c_str());
+    } else {
+        Log("GBAStation GameDB write failed: %s", g_state.gameDbPath.c_str());
+    }
+    g_state.gameDbDirty = false;
+}
+
+void LoadPspPlayStats(const std::string& romPath) {
+    g_state.playCount = 0;
+    g_state.playTimeTotal = 0;
+    g_state.playStatsFound = false;
+    g_state.savePath.clear();
+    g_state.gameDbLoaded = false;
+    g_state.gameDbDirty = false;
+    g_state.gameDbIndex = 0;
+    g_state.gameDbPath.clear();
+    g_state.gameDbData = nlohmann::json();
+    if (romPath.empty()) return;
+
+    const char* dbPaths[] = {
+        "sdmc:/GBAStation/data/GameData_PSP.json",
+        "/GBAStation/data/GameData_PSP.json",
+    };
+    const std::string normalized = NormalizePsRomPath(romPath);
+    for (const char* dbPath : dbPaths) {
+        std::ifstream file(dbPath, std::ios::binary);
+        if (!file.is_open()) continue;
+        nlohmann::json data;
+        try {
+            file >> data;
+        } catch (...) {
+            continue;
+        }
+        if (!data.is_array()) continue;
+        for (size_t idx = 0; idx < data.size(); ++idx) {
+            auto& item = data[idx];
+            if (!item.is_object()) continue;
+            const std::string itemPath = item.value("path", std::string());
+            if (itemPath != romPath && NormalizePsRomPath(itemPath) != normalized) continue;
+            g_state.playStatsFound = true;
+            g_state.playCount = item.value("playCount", 0) + 1;
+            g_state.playTimeTotal = item.value("playTime", 0);
+            g_state.savePath = item.value("savePath", std::string());
+            item["playCount"] = g_state.playCount;
+            g_state.gameDbData = std::move(data);
+            g_state.gameDbIndex = idx;
+            g_state.gameDbPath = dbPath;
+            g_state.gameDbLoaded = true;
+            g_state.gameDbDirty = true;
+            Log("GBAStation play stats start playCount=%d playTime=%d", g_state.playCount, g_state.playTimeTotal);
+            return;
+        }
+    }
+}
+
+// 按归一化路径（不带 sdmc: 前缀）匹配 GameDB：
+// 在已缓存的 GameDB 条目上更新 title/logoPath（内存操作，不读写文件）：
+// - TITLE 仅在 GameDB 的 path 字段文件名（无扩展）与 title 相同时覆盖；
+// - 封面仅当仍是默认资源图（romfs:/ 或空）时更新为 ICON0；用户自定义不覆盖。
+// 变更由 FlushPspGameDb 统一写回。
+void UpdatePspGameDbTitleAndLogo(const std::string& realTitle, const std::string& iconPath) {
+    if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size())
+        return;
+    auto& item = g_state.gameDbData[g_state.gameDbIndex];
+    if (!item.is_object())
+        return;
+    bool changed = false;
+    const std::string itemPath = item.value("path", std::string());
+    std::string itemStem = itemPath;
+    const size_t itemSlash = itemStem.find_last_of("/\\");
+    if (itemSlash != std::string::npos)
+        itemStem = itemStem.substr(itemSlash + 1);
+    const size_t itemDot = itemStem.find_last_of('.');
+    if (itemDot != std::string::npos)
+        itemStem = itemStem.substr(0, itemDot);
+    const std::string curTitle = item.value("title", std::string());
+    if (!realTitle.empty() && curTitle == itemStem) {
+        item["title"] = realTitle;
+        changed = true;
+    }
+    const std::string curLogo = item.value("logoPath", std::string());
+    const bool isDefaultLogo = curLogo.empty() || curLogo.rfind("romfs:/", 0) == 0;
+    if (isDefaultLogo && !iconPath.empty() && curLogo != iconPath) {
+        item["logoPath"] = iconPath;
+        changed = true;
+    }
+    if (changed) {
+        g_state.gameDbDirty = true;
+        Log("GBAStation PSP media updated GameDB title=%s logo=%s", realTitle.c_str(), iconPath.c_str());
+    }
+}
+
+// 当前 ROM 的文件名（无扩展）。
+std::string PspContentStem() {
+    std::string stem = g_state.contentPath;
+    const size_t lastSlash = stem.find_last_of("/\\");
+    if (lastSlash != std::string::npos)
+        stem = stem.substr(lastSlash + 1);
+    const size_t lastDot = stem.find_last_of('.');
+    if (lastDot != std::string::npos)
+        stem = stem.substr(0, lastDot);
+    return stem;
+}
+
+// savePath 下 ICON0 的目标路径（与提取时一致）。
+std::string PspIcon0Path() {
+    const std::string stem = PspContentStem();
+    return stem.empty() ? std::string() : g_state.savePath + "/" + stem + ".icon0.png";
+}
+
+// 首次运行（savePath 下尚无 ICON0）时提取 PSP 内置媒体到存档目录：
+// ICON0 封面 + PIC1 背景。title/logoPath 的 GameDB 更新在退出时进行。
+void ExtractPspMediaIfNeeded() {
+    if (g_state.savePath.empty() || g_state.contentPath.empty())
+        return;
+    const std::string stem = PspContentStem();
+    if (stem.empty())
+        return;
+    const std::string iconPath = PspIcon0Path();
+    struct stat st {};
+    if (stat(iconPath.c_str(), &st) == 0) {
+        Log("GBAStation PSP media already extracted %s", iconPath.c_str());
+        return;
+    }
+
+    std::vector<u8> icon0;
+    std::vector<u8> pic1;
+    std::string filename = Path(g_state.contentPath).GetFilename();
+    std::transform(filename.begin(), filename.end(), filename.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    const bool isPbp = filename.size() >= 4 && filename.compare(filename.size() - 4, 4, ".pbp") == 0;
+
+    if (isPbp) {
+        std::unique_ptr<FileLoader> loader(ConstructFileLoader(Path(g_state.contentPath)));
+        if (loader) {
+            PBPReader pbp(loader.get());
+            if (pbp.IsValid() && !pbp.IsELF()) {
+                pbp.GetSubFile(PBP_ICON0_PNG, &icon0);
+                pbp.GetSubFile(PBP_PIC1_PNG, &pic1);
+            }
+        }
+    } else {
+        PSPFileInfo iconInfo = pspFileSystem.GetFileInfo("disc0:/PSP_GAME/ICON0.PNG");
+        if (iconInfo.exists)
+            pspFileSystem.ReadEntireFile("disc0:/PSP_GAME/ICON0.PNG", icon0);
+        PSPFileInfo pic1Info = pspFileSystem.GetFileInfo("disc0:/PSP_GAME/PIC1.PNG");
+        if (pic1Info.exists)
+            pspFileSystem.ReadEntireFile("disc0:/PSP_GAME/PIC1.PNG", pic1);
+    }
+
+    if (icon0.empty()) {
+        Log("GBAStation PSP media extract failed: no ICON0 in %s", g_state.contentPath.c_str());
+        return;
+    }
+    File::CreateFullPath(Path(g_state.savePath));
+    if (!File::WriteDataToFile(false, icon0.data(), icon0.size(), Path(iconPath))) {
+        Log("GBAStation PSP media extract failed: cannot write %s", iconPath.c_str());
+        return;
+    }
+    if (!pic1.empty()) {
+        const std::string pic1Path = g_state.savePath + "/" + stem + ".pic1.png";
+        File::WriteDataToFile(false, pic1.data(), pic1.size(), Path(pic1Path));
+    }
+    Log("GBAStation PSP media extracted icon0=%s pic1=%d", iconPath.c_str(), (int)pic1.size());
+}
+
+// 在存档目录生成 metadata.json（PARAM.SFO 元数据，key 小写），每次启动刷新。
+void WritePspMetadataJson() {
+    if (g_state.savePath.empty() || g_state.contentPath.empty())
+        return;
+    nlohmann::json meta;
+    meta["title"] = g_paramSFO.GetValueString("TITLE");
+    meta["disc_id"] = g_paramSFO.GetValueString("DISC_ID");
+    meta["disc_version"] = g_paramSFO.GetValueString("DISC_VERSION");
+    meta["category"] = g_paramSFO.GetValueString("CATEGORY");
+    meta["psp_system_ver"] = g_paramSFO.GetValueString("PSP_SYSTEM_VER");
+    meta["region"] = g_paramSFO.GetValueString("REGION");
+    meta["parental_level"] = g_paramSFO.GetValueInt("PARENTAL_LEVEL");
+    meta["bootable"] = g_paramSFO.GetValueInt("BOOTABLE");
+    meta["use_usb"] = g_paramSFO.GetValueInt("USE_USB");
+
+    const std::string metaPath = g_state.savePath + "/metadata.json";
+    File::CreateFullPath(Path(g_state.savePath));
+    std::ofstream out(metaPath, std::ios::trunc);
+    if (!out) {
+        Log("GBAStation PSP metadata write failed %s", metaPath.c_str());
+        return;
+    }
+    out << meta.dump(4);
+    Log("GBAStation PSP metadata written %s", metaPath.c_str());
+}
+void SavePspPlayStats(const std::string& romPath) {
+    if (!g_state.playStatsFound || romPath.empty()) return;
+    if (g_state.playTimeFraction >= 0.5) ++g_state.sessionPlaySeconds;
+    const int totalPlayTime = g_state.playTimeTotal + std::max(0, g_state.sessionPlaySeconds);
+    const std::string lastPlayed = CurrentPsTimestamp();
+
+    const char* dbPaths[] = {
+        "sdmc:/GBAStation/data/GameData_PSP.json",
+        "/GBAStation/data/GameData_PSP.json",
+    };
+    const std::string normalized = NormalizePsRomPath(romPath);
+    for (const char* dbPath : dbPaths) {
+        std::ifstream file(dbPath, std::ios::binary);
+        if (!file.is_open()) continue;
+        nlohmann::json data;
+        try {
+            file >> data;
+        } catch (...) {
+            continue;
+        }
+        if (!data.is_array()) continue;
+        for (auto& item : data) {
+            if (!item.is_object()) continue;
+            const std::string itemPath = item.value("path", std::string());
+            if (itemPath != romPath && NormalizePsRomPath(itemPath) != normalized) continue;
+            item["playCount"] = g_state.playCount;
+            item["playTime"] = std::max(0, totalPlayTime);
+            item["lastPlayed"] = lastPlayed;
+            // Close the read stream first: the Switch stdio/fs layer refuses a
+            // second handle (write/trunc) on a file that is still open for read.
+            file.close();
+            std::ofstream out(dbPath, std::ios::trunc);
+            if (out) {
+                out << data.dump(4);
+                Log("GBAStation play stats exit playCount=%d playTime=%d lastPlayed=%s", g_state.playCount, totalPlayTime, lastPlayed.c_str());
+            } else {
+                Log("GBAStation play stats write failed: %s", dbPath);
+            }
+            return;
+        }
+    }
+}
 std::string GetLegacySaveStateBaseName() {
 
 	std::string romName = g_state.contentPath;
@@ -1255,7 +1583,14 @@ Path GetLegacySaveStatePath(int slot) {
 	}
 
 	const int safeSlot = std::clamp(slot, 0, Ppsspp::SaveStateSlotCount - 1);
-	return Path(Paths::PpssppSaveStates) / (romName + ".state" + std::to_string(safeSlot));
+	// Save dir comes from the launcher GameDB (savePath field); fall back to
+	// the same default layout the launcher would have generated otherwise.
+	std::string saveDir = g_state.savePath;
+	if (saveDir.empty()) {
+		saveDir = std::string(Paths::PpssppSaveStates) + "/" + romName;
+	}
+	File::CreateFullPath(Path(saveDir));
+	return Path(saveDir) / (romName + ".ss" + std::to_string(safeSlot));
 }
 
 u64 GetSystemMs() {
@@ -1596,6 +1931,26 @@ bool PpssppRuntime::LoadContent(const std::string &path) {
 	g_state.booted = true;
 	RetroAchievements().SetGame(path);
 	Log("boot complete");
+
+	// Launcher play stats: bump run count now, write playTime/lastPlayed on exit.
+	LoadPspPlayStats(path);
+	// PSP metadata (PARAM.SFO) -> savePath/metadata.json, refreshed every start.
+	WritePspMetadataJson();
+	// First run (no ICON0 in the save dir yet): extract PSP media and update the
+	// cached GameDB entry in memory.
+	ExtractPspMediaIfNeeded();
+	// Single writeback for playCount / title / logoPath changes.
+	FlushPspGameDb();
+	g_state.autoLoadStateSlot = ConfigInt("save.autoLoadState0", 0);
+	g_state.autoSaveOnExitSlot = std::clamp(ConfigInt("save.autoSaveOnExit", 0), 0, Ppsspp::SaveStateSlotCount);
+	if (g_state.autoLoadStateSlot > 0) {
+		const int slot = std::clamp(g_state.autoLoadStateSlot - 1, 0, Ppsspp::SaveStateSlotCount - 1);
+		const std::string statePath = GetPspSaveStatePath(slot);
+		Log("GBAStation auto load state slot=%d path=%s", slot, statePath.c_str());
+		if (File::Exists(Path(statePath))) {
+			SaveState::Load(Path(statePath), slot, &AfterSaveStateAction);
+		}
+	}
 	return true;
 }
 
@@ -1687,6 +2042,21 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 void PpssppRuntime::RunFrame() {
 	if (!g_state.running || !g_state.booted) {
 		return;
+	}
+
+	// Play time: accumulate wall time while the game is actually running;
+	// menu open pauses the session so menu time is not counted.
+	const double nowPlayMs = time_now_d() * 1000.0;
+	if (!g_state.overlay.IsVisible()) {
+		if (g_state.playTimeLastMs > 0.0) {
+			const double deltaMs = nowPlayMs - g_state.playTimeLastMs;
+			if (deltaMs >= 0.0 && deltaMs < 1000.0) {
+				g_state.playTimeFraction += deltaMs / 1000.0;
+			}
+		}
+		g_state.playTimeLastMs = nowPlayMs;
+	} else {
+		g_state.playTimeLastMs = 0.0;
 	}
 
 	if (g_state.frameCount == 0) {
@@ -1848,6 +2218,27 @@ void PpssppRuntime::RequestExit() {
 
 void PpssppRuntime::Shutdown() {
 	Log("ppsspp runtime shutdown start frames=%d coreState=%d running=%d", g_state.frameCount, (int)coreState, g_state.running ? 1 : 0);
+	// Exit autosave: save the configured slot before tearing the core down,
+	// then flush the async queue once since RunFrame no longer runs.
+	if (g_state.autoSaveOnExitSlot > 0) {
+		const int slot = std::clamp(g_state.autoSaveOnExitSlot - 1, 0, Ppsspp::SaveStateSlotCount - 1);
+		const std::string statePath = GetPspSaveStatePath(slot);
+		Log("GBAStation auto save on exit slot=%d path=%s", slot, statePath.c_str());
+		if (!statePath.empty()) {
+			File::CreateFullPath(Path(Paths::PpssppSaveStates));
+			SaveState::Save(Path(statePath), slot, &AfterSaveStateAction);
+			SaveState::Process();
+		}
+	}
+	// Exit: update title/logoPath in the cached GameDB entry. These follow their
+	// own rules (default-filename title / default-resource logo) and do not
+	// depend on whether ICON0 was actually extracted.
+	if (g_state.gameDbLoaded) {
+		const std::string realTitle = g_paramSFO.GetValueString("TITLE");
+		UpdatePspGameDbTitleAndLogo(realTitle, PspIcon0Path());
+		FlushPspGameDb();
+	}
+	SavePspPlayStats(g_state.contentPath);
 	WaitForCheatLoadThread();
 	DrainMainThreadQueue();
 	if (g_state.hostFrameOpen && gpu) {

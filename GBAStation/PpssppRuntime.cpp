@@ -58,6 +58,10 @@
 
 #include <switch.h>
 
+#if defined(HAVE_LIBRETRO_VFS)
+#include <libretro.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1813,6 +1817,10 @@ PpssppRuntime::PpssppRuntime(LogCallback log) : log_(std::move(log)) {
 
 PpssppRuntime::~PpssppRuntime() = default;
 
+void PpssppRuntime::SetFrontendVFS(retro_vfs_interface *vfs) {
+	frontendVfs_ = vfs;
+}
+
 bool PpssppRuntime::Configure(const LaunchInfo &launch) {
 	g_state.running = true;
 	g_state.booted = false;
@@ -1831,6 +1839,12 @@ bool PpssppRuntime::Configure(const LaunchInfo &launch) {
 }
 
 bool PpssppRuntime::Initialize(const LaunchInfo &) {
+#if defined(HAVE_LIBRETRO_VFS)
+	retro_vfs_interface_info vfsInfo{frontendVfs_ ? 3u : 2u, frontendVfs_};
+	File::InitLibretroVFS(&vfsInfo);
+	Log("PPSSPP frontend VFS=%s", frontendVfs_ ? "custom" : "builtin");
+#endif
+
 	UpdateDisplayMode();
 	Log("initial display=%dx%d", g_display.pixel_xres, g_display.pixel_yres);
 

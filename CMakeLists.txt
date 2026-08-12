@@ -195,6 +195,7 @@ option(ATLAS_TOOL "Set to OFF to not generate the ATLAS_TOOL target" ${ATLAS_TOO
 option(UNITTEST "Set to ON to generate the unittest target" ${UNITTEST})
 option(SIMULATOR "Set to ON when targeting an x86 simulator of an ARM platform" ${SIMULATOR})
 option(LIBRETRO "Set to ON to generate the libretro target" OFF)
+option(USE_FRONTEND_VFS "Enable libretro VFS callbacks for native frontends" OFF)
 # :: Options
 option(USE_LIBNX "Set to ON to build for Switch(libnx)" OFF)
 set(_switch_vulkan_only_default OFF)
@@ -274,13 +275,16 @@ if(UNIX AND NOT (APPLE OR ANDROID) AND VULKAN)
 	endif()
 endif()
 
+if(LIBRETRO OR USE_FRONTEND_VFS)
+	add_compile_definitions(HAVE_LIBRETRO_VFS)
+endif()
+
 if(LIBRETRO)
 	add_compile_definitions(__LIBRETRO__)
 	add_compile_definitions(GLEW_NO_GLU)
 	if(NOT MSVC)
 		add_compile_options(-fPIC)
 	endif()
-	add_compile_definitions(HAVE_LIBRETRO_VFS)
 endif()
 
 if(ANDROID)
@@ -699,6 +703,24 @@ include_directories(ext/OpenXR-SDK/include)
 # For ext/sol includes, that are usually included as sol/*.hpp
 include_directories(ext)
 
+if(USE_FRONTEND_VFS AND NOT LIBRETRO)
+	add_library(ppsspp_frontend_vfs STATIC
+		libretro/libretro-common/compat/compat_posix_string.c
+		libretro/libretro-common/compat/fopen_utf8.c
+		libretro/libretro-common/compat/compat_strl.c
+		libretro/libretro-common/encodings/encoding_utf.c
+		libretro/libretro-common/file/file_path.c
+		libretro/libretro-common/file/file_path_io.c
+		libretro/libretro-common/streams/file_stream.c
+		libretro/libretro-common/streams/file_stream_transforms.c
+		libretro/libretro-common/string/stdstring.c
+		libretro/libretro-common/time/rtime.c
+		libretro/libretro-common/vfs/vfs_implementation.c
+	)
+	target_include_directories(ppsspp_frontend_vfs PUBLIC libretro/libretro-common/include)
+	set_target_properties(ppsspp_frontend_vfs PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED YES)
+endif()
+
 add_library(Common STATIC
 	${CommonX86}
 	${CommonARM}
@@ -998,7 +1020,7 @@ add_library(Common STATIC
 	Common/TimeUtil.h
 )
 
-if(LIBRETRO)
+if(LIBRETRO OR USE_FRONTEND_VFS)
 	target_include_directories(Common PRIVATE libretro/libretro-common/include)
 endif()
 
@@ -1010,6 +1032,10 @@ if(IOS)
 endif()
 
 target_link_libraries(Common Ext::Snappy cpu_features)
+
+if(TARGET ppsspp_frontend_vfs)
+	target_link_libraries(Common ppsspp_frontend_vfs)
+endif()
 
 if(NOT LIBRETRO)
     target_link_libraries(Common imgui)
@@ -1778,7 +1804,7 @@ add_library(native STATIC
 	ext/jpge/jpge.h
 )
 
-if(LIBRETRO)
+if(LIBRETRO OR USE_FRONTEND_VFS)
 	target_include_directories(native PRIVATE libretro/libretro-common/include)
 endif()
 
@@ -2640,7 +2666,7 @@ if((MACOSX OR IOS) AND NOT LIBRETRO)
 		PROPERTIES COMPILE_FLAGS -fobjc-arc)
 endif()
 
-if(LIBRETRO)
+if(LIBRETRO OR USE_FRONTEND_VFS)
 	target_include_directories(${CoreLibName} PRIVATE libretro/libretro-common/include)
 endif()
 
@@ -3073,6 +3099,9 @@ if(USE_LIBNX)
 	)
 	set_target_properties(GBAStation-ppsspp PROPERTIES OUTPUT_NAME "GBAStationPPSSPPStub")
 	target_link_libraries(GBAStation-ppsspp ${COCOA_LIBRARY} ${QUARTZ_CORE_LIBRARY} ${IOKIT_LIBRARY} ${LinkCommon} minimp3)
+	if(TARGET ppsspp_frontend_vfs)
+		target_link_libraries(GBAStation-ppsspp ppsspp_frontend_vfs)
+	endif()
 	if(SWITCH_VULKAN_ONLY)
 		# glslang exposes OSDependent as a bare -l dependency on the Switch
 		# toolchain. Its generated archive is placed in CMake's output lib dir.
@@ -3084,6 +3113,9 @@ if(USE_LIBNX)
 		endif()
 	endif()
 	target_include_directories(GBAStation-ppsspp PRIVATE "${RCHEEVOS_ROOT}/include")
+	if(USE_FRONTEND_VFS)
+		target_include_directories(GBAStation-ppsspp PRIVATE libretro/libretro-common/include)
+	endif()
 	target_compile_definitions(GBAStation-ppsspp PRIVATE RC_CLIENT_SUPPORTS_HASH)
 	target_link_options(GBAStation-ppsspp PRIVATE
 		-Wl,--allow-multiple-definition

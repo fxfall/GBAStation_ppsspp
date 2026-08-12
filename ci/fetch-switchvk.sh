@@ -54,12 +54,33 @@ if [[ -n "$TOKEN" ]]; then
     CURL_AUTH_ARGS=(--config "$AUTH_CONFIG")
 fi
 
-curl "${CURL_AUTH_ARGS[@]}" \
-    --fail --location --silent --show-error \
-    --header 'Accept: application/vnd.github+json' \
-    --header 'X-GitHub-Api-Version: 2022-11-28' \
-    --output "$RELEASE_JSON" \
-    "$API_ROOT/releases/latest"
+# The core tags can be pushed immediately after the SDK tag.  GitHub may
+# start this workflow before the SDK release assets are visible, so wait for
+# the release instead of failing on the first 404/403 response.
+RELEASE_ATTEMPTS=${SWITCHVK_RELEASE_ATTEMPTS:-30}
+RELEASE_WAIT_SECONDS=${SWITCHVK_RELEASE_WAIT_SECONDS:-20}
+release_ready=false
+for ((attempt = 1; attempt <= RELEASE_ATTEMPTS; attempt++)); do
+    http_status=$(curl "${CURL_AUTH_ARGS[@]}" \
+        --location --silent --show-error \
+        --header 'Accept: application/vnd.github+json' \
+        --header 'X-GitHub-Api-Version: 2022-11-28' \
+        --output "$RELEASE_JSON" \
+        --write-out '%{http_code}' \
+        "$API_ROOT/releases/latest" || true)
+    if [[ "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+        release_ready=true
+        break
+    fi
+    if (( attempt < RELEASE_ATTEMPTS )); then
+        echo "switchVK latest Release is not ready (HTTP $http_status); retry $attempt/$RELEASE_ATTEMPTS in ${RELEASE_WAIT_SECONDS}s" >&2
+        sleep "$RELEASE_WAIT_SECONDS"
+    fi
+done
+if [[ "$release_ready" != true ]]; then
+    echo "ERROR: switchVK latest Release was not available after $RELEASE_ATTEMPTS attempts" >&2
+    exit 1
+fi
 
 python3 - "$RELEASE_JSON" "$VARIANT" "$WORK_DIR" <<'PY'
 import json

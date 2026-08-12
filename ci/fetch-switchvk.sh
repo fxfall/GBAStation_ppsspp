@@ -16,6 +16,8 @@ override_repository=${SWITCHVK_REPOSITORY:-}
 # shellcheck disable=SC1090
 source "$LOCK_FILE"
 SWITCHVK_REPOSITORY=${override_repository:-$SWITCHVK_REPOSITORY}
+SWITCHVK_RELEASE_TAG=${SWITCHVK_RELEASE_TAG:-}
+SWITCHVK_SDK_VERSION=${SWITCHVK_SDK_VERSION:-}
 
 case "$VARIANT" in
     release|diagnostic) ;;
@@ -47,7 +49,8 @@ GITHUB_API_URL=${GITHUB_API_URL:-https://api.github.com}
 API_ROOT="$GITHUB_API_URL/repos/$SWITCHVK_REPOSITORY"
 RELEASE_JSON="$WORK_DIR/release.json"
 AUTH_CONFIG="$WORK_DIR/curl-auth.conf"
-CURL_AUTH_ARGS=()
+printf '# No authentication configured.\n' > "$AUTH_CONFIG"
+CURL_AUTH_ARGS=(--config "$AUTH_CONFIG")
 if [[ -n "$TOKEN" ]]; then
     printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$AUTH_CONFIG"
     chmod 600 "$AUTH_CONFIG"
@@ -60,7 +63,10 @@ fi
 RELEASE_ATTEMPTS=${SWITCHVK_RELEASE_ATTEMPTS:-30}
 RELEASE_WAIT_SECONDS=${SWITCHVK_RELEASE_WAIT_SECONDS:-20}
 release_ready=false
-for ((attempt = 1; attempt <= RELEASE_ATTEMPTS; attempt++)); do
+if [[ -n "$SWITCHVK_RELEASE_TAG" && -n "$SWITCHVK_SDK_VERSION" ]]; then
+    release_ready=true
+else
+  for ((attempt = 1; attempt <= RELEASE_ATTEMPTS; attempt++)); do
     http_status=$(curl "${CURL_AUTH_ARGS[@]}" \
         --location --silent --show-error \
         --header 'Accept: application/vnd.github+json' \
@@ -72,17 +78,31 @@ for ((attempt = 1; attempt <= RELEASE_ATTEMPTS; attempt++)); do
         release_ready=true
         break
     fi
-    if (( attempt < RELEASE_ATTEMPTS )); then
-        echo "switchVK latest Release is not ready (HTTP $http_status); retry $attempt/$RELEASE_ATTEMPTS in ${RELEASE_WAIT_SECONDS}s" >&2
-        sleep "$RELEASE_WAIT_SECONDS"
-    fi
-done
+      if (( attempt < RELEASE_ATTEMPTS )); then
+          echo "switchVK latest Release is not ready (HTTP $http_status); retry $attempt/$RELEASE_ATTEMPTS in ${RELEASE_WAIT_SECONDS}s" >&2
+          sleep "$RELEASE_WAIT_SECONDS"
+      fi
+  done
+fi
 if [[ "$release_ready" != true ]]; then
     echo "ERROR: switchVK latest Release was not available after $RELEASE_ATTEMPTS attempts" >&2
     exit 1
 fi
 
-python3 - "$RELEASE_JSON" "$VARIANT" "$WORK_DIR" <<'PY'
+if [[ -n "$SWITCHVK_RELEASE_TAG" && -n "$SWITCHVK_SDK_VERSION" ]]; then
+    if [[ "$VARIANT" == diagnostic ]]; then
+        SWITCHVK_ASSET="switchVK-${SWITCHVK_SDK_VERSION}-diagnostic.tar.xz"
+    else
+        SWITCHVK_ASSET="switchVK-${SWITCHVK_SDK_VERSION}.tar.xz"
+    fi
+    printf '%s\n' "$SWITCHVK_RELEASE_TAG" > "$WORK_DIR/tag"
+    printf '%s\n' "$SWITCHVK_ASSET" > "$WORK_DIR/archive-name"
+    printf 'https://github.com/%s/releases/download/%s/%s\n' \
+        "$SWITCHVK_REPOSITORY" "$SWITCHVK_RELEASE_TAG" "$SWITCHVK_ASSET" > "$WORK_DIR/archive-url"
+    printf 'https://github.com/%s/releases/download/%s/%s.sha256\n' \
+        "$SWITCHVK_REPOSITORY" "$SWITCHVK_RELEASE_TAG" "$SWITCHVK_ASSET" > "$WORK_DIR/checksum-url"
+else
+  python3 - "$RELEASE_JSON" "$VARIANT" "$WORK_DIR" <<'PY'
 import json
 import pathlib
 import re
@@ -122,6 +142,7 @@ for name, value in values.items():
         raise SystemExit(f"invalid latest Release field: {name}")
     pathlib.Path(output_dir, name).write_text(value, encoding="utf-8")
 PY
+fi
 
 SWITCHVK_TAG=$(<"$WORK_DIR/tag")
 SWITCHVK_ASSET=$(<"$WORK_DIR/archive-name")

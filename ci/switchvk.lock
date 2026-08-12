@@ -1,3 +1,5 @@
 # shellcheck shell=bash
 # fetch-switchvk.sh always resolves this repository's latest GitHub Release.
 SWITCHVK_REPOSITORY="fxfall/switchVK"
+SWITCHVK_RELEASE_TAG="sdk-local-0.1.10"
+SWITCHVK_SDK_VERSION="26.1.4"

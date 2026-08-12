@@ -64,12 +64,14 @@ bool RomxFileLoader::Open() {
 		return false;
 	}
 
-	// Validate the container structure and any normative body hash. Metadata
-	// and cover validation is bounded to the optional regions and does not
-	// hash the payload, so opening a large PSP ISO remains practical.
+	// Validate only the container and bounded optional regions here. A body
+	// SHA-256, when present, covers the complete payload and would force a
+	// full large-ISO scan before PPSSPP can start reading it. The frontend and
+	// packer may perform that integrity check separately; the direct loader
+	// must keep payload access streaming.
 	romx_validation_report_t report = ROMX_VALIDATION_REPORT_INIT;
 	const romx_validate_flags_t validationFlags =
-		ROMX_VALIDATE_BODY_SHA256 | ROMX_VALIDATE_METADATA | ROMX_VALIDATE_COVER;
+		ROMX_VALIDATE_METADATA | ROMX_VALIDATE_COVER;
 	if (romx_reader_validate(reader_, validationFlags, &report, &error) != ROMX_OK) {
 		romx_reader_close(reader_);
 		reader_ = nullptr;

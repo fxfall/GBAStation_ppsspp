@@ -196,6 +196,7 @@ option(UNITTEST "Set to ON to generate the unittest target" ${UNITTEST})
 option(SIMULATOR "Set to ON when targeting an x86 simulator of an ARM platform" ${SIMULATOR})
 option(LIBRETRO "Set to ON to generate the libretro target" OFF)
 option(USE_ROMX "Enable direct loading of complete ROMX containers" OFF)
+set(GBASTATION_ROMX_VERSION "0.1.1" CACHE STRING "ROMX core release version")
 # :: Options
 option(USE_LIBNX "Set to ON to build for Switch(libnx)" OFF)
 set(_switch_vulkan_only_default OFF)
@@ -3129,7 +3130,7 @@ if(USE_LIBNX)
 	nx_generate_nacp(GBAStationPPSSPPStub.nacp
 		NAME "GBAStation PPSSPP Stub"
 		AUTHOR "GBAStation"
-		VERSION "2.0.2"
+		VERSION "${GBASTATION_ROMX_VERSION}"
 	)
 	nx_create_nro(GBAStation-ppsspp NACP GBAStationPPSSPPStub.nacp ROMFS "${GBAStation-ppsspp_ROMFS_DIR}")
 endif()

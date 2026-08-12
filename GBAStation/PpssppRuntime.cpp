@@ -1432,13 +1432,16 @@ void ExtractPspMediaIfNeeded() {
 
     std::vector<u8> icon0;
     std::vector<u8> pic1;
-    std::string filename = Path(g_state.contentPath).GetFilename();
-    std::transform(filename.begin(), filename.end(), filename.begin(),
-        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    const bool isPbp = filename.size() >= 4 && filename.compare(filename.size() - 4, 4, ".pbp") == 0;
+
+    // ConstructFileLoader presents a ROMX alias such as .pbpx as its virtual
+    // payload extension (.pbp). Use that extension instead of the raw
+    // container filename, otherwise a direct .pbpx launch is mistaken for an
+    // ISO and the PBP's ICON0/PIC1 cannot be extracted.
+    std::unique_ptr<FileLoader> loader(ConstructFileLoader(Path(g_state.contentPath)));
+    const std::string payloadExtension = loader ? loader->GetFileExtension() : std::string();
+    const bool isPbp = payloadExtension == ".pbp";
 
     if (isPbp) {
-        std::unique_ptr<FileLoader> loader(ConstructFileLoader(Path(g_state.contentPath)));
         if (loader) {
             PBPReader pbp(loader.get());
             if (pbp.IsValid() && !pbp.IsELF()) {

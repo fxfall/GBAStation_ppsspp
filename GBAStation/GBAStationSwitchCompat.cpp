@@ -9,10 +9,34 @@
 
 extern "C" {
 
-// libnx has no privileged-process environment.  This resolves Mesa's glibc
-// compatibility import without changing the switchVK static library.
-char *secure_getenv(const char *name) {
-    return std::getenv(name);
+// Mesa/NVK supplies the secure_getenv fallback in its utility object.  Do not
+// provide a second copy here: the static linker may pull both objects in when
+// the PPSSPP frontend and NVK are linked together.
+
+void* memalign(size_t alignment, size_t size);
+int posix_memalign(void** memptr, size_t alignment, size_t size) {
+	if (!memptr || alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) {
+		return EINVAL;
+	}
+	void* pointer = memalign(alignment, size);
+	if (!pointer) {
+		return ENOMEM;
+	}
+	*memptr = pointer;
+	return 0;
+}
+
+ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
+	const off_t original_offset = lseek(fd, 0, SEEK_CUR);
+	if (original_offset == static_cast<off_t>(-1) ||
+		lseek(fd, offset, SEEK_SET) == static_cast<off_t>(-1)) {
+		return -1;
+	}
+	const ssize_t result = read(fd, buf, count);
+	const int saved_errno = errno;
+	(void)lseek(fd, original_offset, SEEK_SET);
+	errno = saved_errno;
+	return result;
 }
 
 int regcomp(void *preg, const char *regex, int cflags) {

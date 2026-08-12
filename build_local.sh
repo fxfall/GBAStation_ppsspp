@@ -38,6 +38,22 @@ if [[ -z "${SWITCH_NVK_ROOT:-}" ]]; then
     done
 fi
 
+# Keep the local PPSSPP workflow consistent with the 3DS core: when the
+# sibling SDK project is present, build its public-NXVK package automatically
+# instead of requiring a private Release download first. CI can still provide
+# SWITCH_NVK_ROOT explicitly and will skip this path.
+if [[ -z "${SWITCH_NVK_ROOT:-}" && "${SWITCHVK_AUTOBUILD:-1}" != 0 ]]; then
+    SWITCHVK_DIR="$SCRIPT_DIR/../switchVK"
+    if [[ -x "$SWITCHVK_DIR/build_local.sh" ]]; then
+        bash "$SWITCHVK_DIR/build_local.sh" -j "${SWITCHVK_JOBS:-$(nproc)}"
+        for candidate in "$SWITCHVK_DIR"/nvk-switch-*; do
+            [[ -f "$candidate/lib/libvulkan.a" ]] || continue
+            SWITCH_NVK_ROOT=$candidate
+            break
+        done
+    fi
+fi
+
 if [[ ! -f "${SWITCH_NVK_ROOT:-}/lib/libvulkan.a" ]] ||
    [[ ! -f "${SWITCH_NVK_ROOT:-}/include/vulkan/vulkan.h" ]]; then
 	echo "Missing complete switchVK SDK. Set SWITCH_NVK_ROOT to an SDK containing include/ and lib/libvulkan.a." >&2

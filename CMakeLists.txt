@@ -339,6 +339,10 @@ if(USE_LIBNX)
 			find_library(VULKAN_LIBRARY vulkan REQUIRED)
 		endif()
 		set(OPENGL_LIBRARIES ${VULKAN_LIBRARY})
+		# xmlconfig.c in the static NVK archive uses Mesa's Expat-backed
+		# driconf parser. Keep expat adjacent to the Vulkan archive so static
+		# link ordering resolves those symbols.
+		list(APPEND OPENGL_LIBRARIES expat)
 	else()
 		find_library(GLESV2_LIBRARY GLESv2 REQUIRED)
 		find_library(GLAPI_LIBRARY glapi REQUIRED)

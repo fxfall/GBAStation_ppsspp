@@ -114,7 +114,10 @@ size_t RomxFileLoader::ReadAt(s64 absolutePos, size_t bytes, size_t count, void 
 	}
 
 	std::lock_guard<std::mutex> guard(readLock_);
-	u64 bytesRead = 0;
+	// libromx uses the platform uint64_t typedef (unsigned long on
+	// devkitA64), while PPSSPP's u64 is always unsigned long long.
+	// Keep the out-parameter's exact API type on every target.
+	uint64_t bytesRead = 0;
 	romx_error_t error{};
 	if (romx_reader_read_region(reader_, ROMX_REGION_ROM,
 		static_cast<u64>(absolutePos), data, wholeBytes, &bytesRead, &error) != ROMX_OK) {

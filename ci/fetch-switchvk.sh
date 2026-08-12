@@ -30,11 +30,7 @@ if [[ ! "$SWITCHVK_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
 fi
 
 TOKEN=${SWITCHVK_TOKEN:-${GH_TOKEN:-}}
-if [[ -z "$TOKEN" ]]; then
-    echo "ERROR: SWITCHVK_TOKEN is required to read the private $SWITCHVK_REPOSITORY Release" >&2
-    exit 1
-fi
-if [[ ! "$TOKEN" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+if [[ -n "$TOKEN" && ! "$TOKEN" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     echo "ERROR: SWITCHVK_TOKEN contains unexpected characters" >&2
     exit 2
 fi
@@ -51,10 +47,14 @@ GITHUB_API_URL=${GITHUB_API_URL:-https://api.github.com}
 API_ROOT="$GITHUB_API_URL/repos/$SWITCHVK_REPOSITORY"
 RELEASE_JSON="$WORK_DIR/release.json"
 AUTH_CONFIG="$WORK_DIR/curl-auth.conf"
-printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$AUTH_CONFIG"
-chmod 600 "$AUTH_CONFIG"
+CURL_AUTH_ARGS=()
+if [[ -n "$TOKEN" ]]; then
+    printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$AUTH_CONFIG"
+    chmod 600 "$AUTH_CONFIG"
+    CURL_AUTH_ARGS=(--config "$AUTH_CONFIG")
+fi
 
-curl --config "$AUTH_CONFIG" \
+curl "${CURL_AUTH_ARGS[@]}" \
     --fail --location --silent --show-error \
     --header 'Accept: application/vnd.github+json' \
     --header 'X-GitHub-Api-Version: 2022-11-28' \
@@ -112,7 +112,7 @@ CHECKSUM_FILE="$WORK_DIR/$SWITCHVK_ASSET.sha256"
 download_asset() {
     local asset_api_url=$1
     local output_path=$2
-    curl --config "$AUTH_CONFIG" \
+    curl "${CURL_AUTH_ARGS[@]}" \
         --fail --location --silent --show-error \
         --header 'Accept: application/octet-stream' \
         --header 'X-GitHub-Api-Version: 2022-11-28' \

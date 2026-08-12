@@ -71,3 +71,7 @@
 [submodule "rcheevos"]
 	path = rcheevos
 	url = https://github.com/RetroAchievements/rcheevos.git
+[submodule "third_party/libromx"]
+	path = third_party/libromx
+	url = https://github.com/fxfall/libromx.git
+	branch = main

@@ -25,6 +25,9 @@
 #include "Core/FileLoaders/DiskCachingFileLoader.h"
 #include "Core/FileLoaders/HTTPFileLoader.h"
 #include "Core/FileLoaders/LocalFileLoader.h"
+#ifdef PPSSPP_USE_ROMX
+#include "Core/FileLoaders/RomxFileLoader.h"
+#endif
 #include "Core/FileLoaders/RetryingFileLoader.h"
 #include "Core/FileLoaders/ZipFileLoader.h"
 #include "Core/FileSystems/MetaFileSystem.h"
@@ -59,6 +62,12 @@ FileLoader *ConstructFileLoader(const Path &filename) {
 		}
 		return new CachingFileLoader(baseLoader);
 	}
+
+#ifdef PPSSPP_USE_ROMX
+	if (RomxFileLoader *romxLoader = RomxFileLoader::TryCreate(filename)) {
+		return romxLoader;
+	}
+#endif
 
 	return new LocalFileLoader(filename);
 }

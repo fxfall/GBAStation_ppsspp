@@ -145,6 +145,7 @@ cmake_args=(
 	-DENABLE_PCH=OFF
 	-DHEADLESS=ON
 	-DLIBRETRO=OFF
+	-DUSE_ROMX=ON
 	-DCMAKE_BUILD_TYPE=Release
 	-U CMAKE_EXE_LINKER_FLAGS_RELEASE
 	-DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -g0 -ffunction-sections -fdata-sections -fomit-frame-pointer"

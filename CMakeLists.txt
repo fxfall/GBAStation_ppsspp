@@ -195,6 +195,7 @@ option(ATLAS_TOOL "Set to OFF to not generate the ATLAS_TOOL target" ${ATLAS_TOO
 option(UNITTEST "Set to ON to generate the unittest target" ${UNITTEST})
 option(SIMULATOR "Set to ON when targeting an x86 simulator of an ARM platform" ${SIMULATOR})
 option(LIBRETRO "Set to ON to generate the libretro target" OFF)
+option(USE_ROMX "Enable direct loading of complete ROMX containers" OFF)
 # :: Options
 option(USE_LIBNX "Set to ON to build for Switch(libnx)" OFF)
 set(_switch_vulkan_only_default OFF)
@@ -609,6 +610,10 @@ macro(setup_target_project TargetName ProjectDir)
 endmacro()
 
 add_subdirectory(ext)
+
+if(USE_ROMX)
+	add_subdirectory(third_party/libromx ${CMAKE_BINARY_DIR}/libromx EXCLUDE_FROM_ALL)
+endif()
 
 set(CommonJIT
 	Core/MIPS/JitCommon/JitCommon.cpp
@@ -2194,6 +2199,14 @@ if((MACOSX OR IOS) AND NOT LIBRETRO)
 		Core/Util/DarwinFileSystemServices.h)
 endif()
 
+set(CoreRomxSources)
+if(USE_ROMX)
+	list(APPEND CoreRomxSources
+		Core/FileLoaders/RomxFileLoader.cpp
+		Core/FileLoaders/RomxFileLoader.h
+	)
+endif()
+
 # 'ppsspp_jni' on ANDROID, 'Core' everywhere else
 # SHARED on ANDROID, STATIC everywhere else
 add_library(${CoreLibName} ${CoreLinkType}
@@ -2549,6 +2562,7 @@ add_library(${CoreLibName} ${CoreLinkType}
 	Core/FileLoaders/HTTPFileLoader.h
 	Core/FileLoaders/LocalFileLoader.cpp
 	Core/FileLoaders/LocalFileLoader.h
+	${CoreRomxSources}
 	Core/FileLoaders/RamCachingFileLoader.cpp
 	Core/FileLoaders/RamCachingFileLoader.h
 	Core/FileLoaders/RetryingFileLoader.cpp
@@ -2717,6 +2731,11 @@ endif()
 
 target_link_libraries(${CoreLibName} Common native chdr kirk cityhash sfmt19937 xbrz xxhash rcheevos minimp3 at3_standalone lua ${GlslangLibs}
 	${CoreExtraLibs} ${OPENGL_LIBRARIES} ${X11_LIBRARIES} ${PPSSPP_DL_LIBS})
+
+if(USE_ROMX)
+	target_compile_definitions(${CoreLibName} PRIVATE PPSSPP_USE_ROMX)
+	target_link_libraries(${CoreLibName} ROMX::romx)
+endif()
 
 # Winsock
 if(WIN32)

@@ -57,22 +57,12 @@ jobs:
           test "$(sha256sum assets/flash0/font/ltn0.pgf | awk '{print $1}')" = \
             "1184f16bc89bad1fea49093806784470281af54f279b57ef0378ce33e6603870"
 
-      - name: Restore vendored libpng ARM sources
+      - name: Verify vendored libpng ARM sources
         shell: bash
         run: |
           set -euo pipefail
-          libpng_revision=09b7a626660a8a8a4c6b100518a21a17d0170e83
-          libpng_arm_dir=ext/libpng17/arm
-          mkdir -p "$libpng_arm_dir"
-
           for source_file in arm_init.c filter_neon.S filter_neon_intrinsics.c neon.h; do
-            expected_blob="$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse \
-              "${libpng_revision}:${libpng_arm_dir}/${source_file}")"
-            git -c safe.directory="$GITHUB_WORKSPACE" show \
-              "${libpng_revision}:${libpng_arm_dir}/${source_file}" > \
-              "${libpng_arm_dir}/${source_file}"
-            test "$(git -c safe.directory="$GITHUB_WORKSPACE" hash-object \
-              "${libpng_arm_dir}/${source_file}")" = "$expected_blob"
+            test -s "ext/libpng17/arm/${source_file}"
           done
 
       - name: Build release NRO

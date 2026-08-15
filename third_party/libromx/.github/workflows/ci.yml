@@ -1,0 +1,190 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+  CTEST_OUTPUT_ON_FAILURE: 1
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GCC static
+            os: ubuntu-latest
+            shared: "OFF"
+            cmake_args: >-
+              -DCMAKE_C_COMPILER=gcc
+              -DCMAKE_CXX_COMPILER=g++
+              -DCMAKE_C_FLAGS=-Werror
+              -DCMAKE_CXX_FLAGS=-Werror
+          - name: Linux Clang shared
+            os: ubuntu-latest
+            shared: "ON"
+            cmake_args: >-
+              -DCMAKE_C_COMPILER=clang
+              -DCMAKE_CXX_COMPILER=clang++
+              -DCMAKE_C_FLAGS=-Werror
+              -DCMAKE_CXX_FLAGS=-Werror
+          - name: macOS AppleClang static
+            os: macos-latest
+            shared: "OFF"
+            cmake_args: >-
+              -DCMAKE_C_FLAGS=-Werror
+              -DCMAKE_CXX_FLAGS=-Werror
+          - name: Windows MSVC shared
+            os: windows-latest
+            shared: "ON"
+            cmake_args: >-
+              -DCMAKE_C_FLAGS=/WX
+              -DCMAKE_CXX_FLAGS=/WX
+
+    steps:
+      - name: Disable Git line-ending conversion
+        run: git config --global core.autocrlf false
+
+      - name: Checkout libromx
+        uses: actions/checkout@v6
+
+      - name: Checkout frozen ROMX specification
+        uses: actions/checkout@v6
+        with:
+          repository: fxfall/romx-container-spec
+          ref: main
+          path: romx-spec
+
+      - name: Verify frozen fixtures
+        run: python romx-spec/tools/generate_fixtures.py --check
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_SHARED_LIBS=${{ matrix.shared }}
+          -DROMX_BUILD_TESTS=ON
+          -DROMX_BUILD_EXAMPLES=ON
+          -DROMX_CONFORMANCE_FIXTURE_DIR="${{ github.workspace }}/romx-spec/tests/fixtures"
+          ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Add Windows build DLL directory to PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "${{ github.workspace }}\build\Release" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Trace Windows phase1 test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ROMX_TEST_TRACE: "1"
+        run: |
+          $test = Join-Path $env:GITHUB_WORKSPACE "build\tests\Release\romx_phase1_tests.exe"
+          $stdout = Join-Path $env:RUNNER_TEMP "romx-phase1.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "romx-phase1.stderr.log"
+          Remove-Item $stdout, $stderr -Force -ErrorAction SilentlyContinue
+          $process = Start-Process -FilePath $test `
+            -WorkingDirectory (Split-Path -Parent $test) `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+          if (-not $process.WaitForExit(60000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            if (Test-Path $stdout) { Get-Content $stdout }
+            if (Test-Path $stderr) { Get-Content $stderr }
+            throw "romx.phase1 did not finish within 60 seconds"
+          }
+          if (Test-Path $stdout) { Get-Content $stdout }
+          if (Test-Path $stderr) { Get-Content $stderr }
+          if ($process.ExitCode -ne 0) {
+            throw "romx.phase1 exited with code $($process.ExitCode)"
+          }
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure --no-tests=error --timeout 120
+
+      - name: Install
+        run: >-
+          cmake --install build --config Release
+          --prefix "${{ github.workspace }}/install"
+
+      - name: Configure installed-package consumer
+        run: >-
+          cmake -S tests/package_consumer -B build-consumer
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install"
+
+      - name: Build installed-package consumer
+        run: cmake --build build-consumer --config Release
+
+      - name: Run installed-package consumer
+        if: runner.os != 'Windows'
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/install/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/install/lib
+        run: ./build-consumer/romx_package_consumer
+
+      - name: Run installed-package consumer on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH = "${{ github.workspace }}\install\bin;$env:PATH"
+          & "${{ github.workspace }}\build-consumer\Release\romx_package_consumer.exe"
+
+  sanitizers:
+    name: Linux Clang ASan and UBSan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Disable Git line-ending conversion
+        run: git config --global core.autocrlf false
+
+      - name: Checkout libromx
+        uses: actions/checkout@v6
+
+      - name: Checkout frozen ROMX specification
+        uses: actions/checkout@v6
+        with:
+          repository: fxfall/romx-container-spec
+          ref: main
+          path: romx-spec
+
+      - name: Configure sanitizers
+        run: >-
+          cmake -S . -B build-sanitize
+          -DCMAKE_BUILD_TYPE=Debug
+          -DROMX_BUILD_TESTS=ON
+          -DROMX_BUILD_EXAMPLES=OFF
+          -DROMX_CONFORMANCE_FIXTURE_DIR="${{ github.workspace }}/romx-spec/tests/fixtures"
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_C_FLAGS="-Werror -fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_CXX_FLAGS="-Werror -fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build sanitizers
+        run: cmake --build build-sanitize
+
+      - name: Test sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: >-
+          ctest --test-dir build-sanitize --output-on-failure
+          --no-tests=error

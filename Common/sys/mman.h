@@ -1,3 +1,13 @@
+#if !defined(__SWITCH__)
+
+// This compatibility header is only needed by the Switch/libnx build.  The
+// desktop targets must use the platform's real mmap implementation; including
+// Switch's SDK unconditionally prevents the upstream Linux/Windows targets
+// from compiling.
+#include_next <sys/mman.h>
+
+#else
+
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -63,3 +73,5 @@ static inline int munmap(void *addr, size_t len) {
 #ifdef __cplusplus
 };
 #endif // MMAN_H
+
+#endif // __SWITCH__

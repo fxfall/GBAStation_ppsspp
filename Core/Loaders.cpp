@@ -25,6 +25,7 @@
 #include "Core/FileLoaders/DiskCachingFileLoader.h"
 #include "Core/FileLoaders/HTTPFileLoader.h"
 #include "Core/FileLoaders/LocalFileLoader.h"
+#include "Core/FileLoaders/RomxFileLoader.h"
 #include "Core/FileLoaders/RetryingFileLoader.h"
 #include "Core/FileLoaders/ZipFileLoader.h"
 #include "Core/FileSystems/MetaFileSystem.h"
@@ -51,6 +52,13 @@ struct PVD {
 };
 
 FileLoader *ConstructFileLoader(const Path &filename) {
+	// ROMX is a container, not a new PSP media format.  Present its typed
+	// entrypoint as a virtual .iso/.cso/.pbp file so the existing PPSSPP
+	// identification and filesystem code remains unchanged.
+	if (filename.GetFileExtension() == ".romx") {
+		return new RomxFileLoader(filename);
+	}
+
 	if (filename.Type() == PathType::HTTP) {
 		FileLoader *baseLoader = new RetryingFileLoader(new HTTPFileLoader(filename));
 		// For headless, avoid disk caching since it's usually used for tests that might mutate.

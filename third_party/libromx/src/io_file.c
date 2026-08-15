@@ -95,9 +95,28 @@ static romx_result_t romx_file_read_at(void *user_data, uint64_t offset,
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+/*
+ * The Switch sysroot intentionally does not expose POSIX mmap headers.  The
+ * file-backed reader and VFS remain fully usable there; only the optional
+ * zero-copy payload mapping is unavailable.  Keep mmap enabled on platforms
+ * that provide it (Linux, macOS, BSD, ...), while making the embedded
+ * libromx target portable to the Switch toolchain.
+ */
+#if !defined(__SWITCH__) && defined(__has_include)
+#if __has_include(<sys/mman.h>)
 #include <sys/mman.h>
+#define ROMX_FILE_HAS_MMAP 1
+#endif
+#endif
+
+#ifndef ROMX_FILE_HAS_MMAP
+#define ROMX_FILE_HAS_MMAP 0
+#endif
 
 typedef struct romx_file_io { int descriptor; uint64_t size; } romx_file_io_t;
+
+#if ROMX_FILE_HAS_MMAP
 
 static int romx_file_pread_exact(
     int descriptor, uint64_t offset, uint8_t *buffer, size_t size,
@@ -118,6 +137,10 @@ static int romx_file_pread_exact(
     }
     return *bytes_read == size;
 }
+
+#endif /* ROMX_FILE_HAS_MMAP */
+
+#if ROMX_FILE_HAS_MMAP
 
 static void romx_file_mapping_release(romx_payload_mapping_t *mapping)
 {
@@ -290,6 +313,8 @@ static romx_result_t romx_file_map_payload(
     return ROMX_OK;
 }
 
+#endif
+
 static void romx_file_close(void *user_data)
 {
     romx_file_io_t *state = (romx_file_io_t *)user_data;
@@ -315,7 +340,10 @@ static romx_result_t romx_file_read_at(void *user_data, uint64_t offset,
         ROMX_E_RANGE, 0, offset, "file offset exceeds platform limit");
     while (*bytes_read < size) {
         uint64_t remaining = size - *bytes_read;
-        size_t count = remaining > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)remaining;
+        /* Some embedded C libraries omit SSIZE_MAX even though pread is
+         * available.  SIZE_MAX / 2 is a conservative ssize_t-sized chunk. */
+        const uint64_t max_read = (uint64_t)(SIZE_MAX / 2U);
+        size_t count = remaining > max_read ? (size_t)max_read : (size_t)remaining;
         ssize_t actual = pread(state->descriptor, output + (size_t)*bytes_read,
             count, (off_t)(offset + *bytes_read));
         if (actual < 0) {
@@ -379,7 +407,7 @@ romx_result_t romx_reader_open_path(const char *utf8_path,
     io.user_data = state; io.get_size = romx_file_get_size; io.read_at = romx_file_read_at;
     result = romx_reader_create(&io, options, romx_file_close, out_reader, error);
     if (result != ROMX_OK) romx_file_close(state);
-#if !defined(_WIN32)
+#if !defined(_WIN32) && ROMX_FILE_HAS_MMAP
     else (*out_reader)->map_payload = romx_file_map_payload;
 #endif
     return result;

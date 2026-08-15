@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <malloc.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -9,10 +10,43 @@
 
 extern "C" {
 
+// newlib on Horizon does not expose POSIX pread().  Preserve the caller's
+// file position while providing the offset-read contract used by libromx.
+ssize_t pread(int fd, void* buffer, size_t count, off_t offset) {
+    const off_t original_offset = lseek(fd, 0, SEEK_CUR);
+    if (original_offset == static_cast<off_t>(-1)) {
+        return -1;
+    }
+    if (lseek(fd, offset, SEEK_SET) == static_cast<off_t>(-1)) {
+        return -1;
+    }
+    const ssize_t result = read(fd, buffer, count);
+    const int saved_errno = errno;
+    (void)lseek(fd, original_offset, SEEK_SET);
+    errno = saved_errno;
+    return result;
+}
+
 // libnx has no privileged-process environment.  This resolves Mesa's glibc
 // compatibility import without changing the switchVK static library.
-char *secure_getenv(const char *name) {
+__attribute__((weak)) char *secure_getenv(const char *name) {
     return std::getenv(name);
+}
+
+// newlib exposes aligned_alloc/memalign but not the POSIX wrapper used by
+// Mesa's portable utility code.  Export a weak adapter for the Switch link;
+// a future libc implementation can override it.
+__attribute__((weak)) int posix_memalign(void** memory, size_t alignment, size_t size) {
+    if (memory == nullptr || alignment < sizeof(void*) ||
+        (alignment & (alignment - 1U)) != 0U) {
+        return EINVAL;
+    }
+    void* pointer = memalign(alignment, size);
+    if (pointer == nullptr) {
+        return ENOMEM;
+    }
+    *memory = pointer;
+    return 0;
 }
 
 int regcomp(void *preg, const char *regex, int cflags) {

@@ -63,16 +63,21 @@ jobs:
           set -euo pipefail
           libpng_revision=09b7a626660a8a8a4c6b100518a21a17d0170e83
           libpng_arm_dir=ext/libpng17/arm
+          libpng_raw_base="https://raw.githubusercontent.com/hrydgard/ppsspp/${libpng_revision}/${libpng_arm_dir}"
           mkdir -p "$libpng_arm_dir"
 
-          for source_file in arm_init.c filter_neon.S filter_neon_intrinsics.c neon.h; do
-            expected_blob="$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse \
-              "${libpng_revision}:${libpng_arm_dir}/${source_file}")"
-            git -c safe.directory="$GITHUB_WORKSPACE" show \
-              "${libpng_revision}:${libpng_arm_dir}/${source_file}" > \
-              "${libpng_arm_dir}/${source_file}"
-            test "$(git -c safe.directory="$GITHUB_WORKSPACE" hash-object \
-              "${libpng_arm_dir}/${source_file}")" = "$expected_blob"
+          declare -A expected_sha1=(
+            [arm_init.c]=9236798bee12782da9d6783163acb6b2ab7bdee0
+            [filter_neon.S]=e111b6646e85659b61cbfd2c7ae77a11cd2cbb0f
+            [filter_neon_intrinsics.c]=42635112e4dc58e17def9b8679a49698a1919dc4
+            [neon.h]=ebd59b9fa04a81094c8bd5e22ccb2e0b89cd8624
+          )
+          for source_file in "${!expected_sha1[@]}"; do
+            curl --fail --location --retry 3 --retry-all-errors \
+              "$libpng_raw_base/$source_file" \
+              --output "$libpng_arm_dir/$source_file"
+            test "$(sha1sum "$libpng_arm_dir/$source_file" | awk '{print $1}')" = \
+              "${expected_sha1[$source_file]}"
           done
 
       - name: Build release NRO

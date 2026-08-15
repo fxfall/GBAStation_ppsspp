@@ -51,6 +51,7 @@
 #include "dep/nlohmann/json.hpp"
 #include "Core/Screenshot.h"
 #include "GPU/Common/FramebufferManagerCommon.h"
+#include "GPU/Common/PostShader.h"
 #include "Core/Screenshot.h"
 #include "Core/System.h"
 #include "Core/Util/PathUtil.h"
@@ -1312,6 +1313,97 @@ void FlushPspGameDb() {
     g_state.gameDbDirty = false;
 }
 
+void ApplyPspGameDbDisplaySettings(const nlohmann::json &item) {
+	// These names match the generic GameDB schema already used by FBNeo and
+	// 3DS.  Missing values intentionally leave the user's global defaults in
+	// place, preserving backward compatibility with existing entries.
+	const int displayMode = item.value("displayMode", -1);
+	const int internalResolution = item.value("ndsInternalResolution", -1);
+	const std::string screenLayout = item.value("ndsScreenLayout", std::string());
+	if (displayMode < 0 && internalResolution < 0 && screenLayout.empty())
+		return;
+	if (g_state.overlay.IsReady())
+		g_state.overlay.SetGameDisplaySettings(displayMode, screenLayout, internalResolution);
+}
+
+void ApplyPspGameDbShaderSettings(const nlohmann::json &item) {
+	// Slang presets are registered after the graphics host starts.  Unknown or
+	// removed presets are ignored, leaving the regular global setting intact.
+	if (!item.value("shaderEnabled", false))
+		return;
+	const std::string preset = item.value("shaderPath", std::string());
+	if (preset.empty())
+		return;
+	const ShaderInfo *info = GetPostShaderInfo(preset);
+	if (!info || !info->isSlang)
+		return;
+	g_Config.vPostShaderNames.assign(1, info->section);
+	FixPostShaderOrder(&g_Config.vPostShaderNames);
+	const auto names = item.value("shaderParaNames", std::vector<std::string>{});
+	const auto values = item.value("shaderParaValues", std::vector<float>{});
+	for (size_t i = 0; i < names.size() && i < values.size(); ++i) {
+		const std::string key = StringFromFormat("%sSettingCurrentValue%u", info->section.c_str(), (unsigned)i + 1);
+		g_Config.mPostShaderSetting[key] = values[i];
+	}
+}
+
+void ApplyPspGameDbMaskSettings(const nlohmann::json &item) {
+	if (!g_state.overlay.IsReady())
+		return;
+	g_state.overlay.SetGameMaskSettings(item.value("overlayEnabled", false),
+		item.value("overlayPath", std::string()));
+}
+
+void SavePspGameDbDisplaySettings() {
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size())
+		return;
+	auto &item = g_state.gameDbData[g_state.gameDbIndex];
+	if (!item.is_object())
+		return;
+	item["displayMode"] = g_state.overlay.GameDisplayModeIndex();
+	item["ndsScreenLayout"] = g_state.overlay.GameScreenLayout();
+	item["ndsInternalResolution"] = std::clamp(g_Config.iInternalResolution, 0, 10);
+	item["ndsIntegerScale"] = g_state.overlay.GameDisplayModeIndex() == static_cast<int>(DisplayMode::Integer);
+	item["overlayEnabled"] = g_state.overlay.IsGameMaskEnabled();
+	item["overlayPath"] = g_state.overlay.GameMaskPath();
+	g_state.gameDbDirty = true;
+	FlushPspGameDb();
+}
+
+void SavePspGameDbShaderSettings() {
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size())
+		return;
+	auto &item = g_state.gameDbData[g_state.gameDbIndex];
+	if (!item.is_object())
+		return;
+	const ShaderInfo *slang = nullptr;
+	for (const std::string &name : g_Config.vPostShaderNames) {
+		const ShaderInfo *candidate = GetPostShaderInfo(name);
+		if (candidate && candidate->isSlang) {
+			slang = candidate;
+			break;
+		}
+	}
+	item["shaderEnabled"] = slang != nullptr;
+	item["shaderPath"] = slang ? slang->section : std::string();
+	item["shaderParaPath"] = slang ? slang->section : std::string();
+	std::vector<std::string> names;
+	std::vector<float> values;
+	if (slang && slang->slangPreset) {
+		for (size_t i = 0; i < slang->slangPreset->parameters.size(); ++i) {
+			const SlangParameter &param = slang->slangPreset->parameters[i];
+			names.emplace_back(param.id);
+			const std::string key = StringFromFormat("%sSettingCurrentValue%u", slang->section.c_str(), (unsigned)i + 1);
+			auto it = g_Config.mPostShaderSetting.find(key);
+			values.push_back(it == g_Config.mPostShaderSetting.end() ? param.current : it->second);
+		}
+	}
+	item["shaderParaNames"] = std::move(names);
+	item["shaderParaValues"] = std::move(values);
+	g_state.gameDbDirty = true;
+	FlushPspGameDb();
+}
+
 void LoadPspPlayStats(const std::string& romPath) {
     g_state.playCount = 0;
     g_state.playTimeTotal = 0;
@@ -1354,6 +1446,9 @@ void LoadPspPlayStats(const std::string& romPath) {
             g_state.gameDbPath = dbPath;
             g_state.gameDbLoaded = true;
             g_state.gameDbDirty = true;
+			ApplyPspGameDbDisplaySettings(item);
+			ApplyPspGameDbShaderSettings(item);
+			ApplyPspGameDbMaskSettings(item);
             Log("GBAStation play stats start playCount=%d playTime=%d", g_state.playCount, g_state.playTimeTotal);
             return;
         }
@@ -1972,6 +2067,9 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 		g_state.settingsJitClear = g_Config.bFastMemory != prevFastMemory;
 		Log("queued PPSSPP runtime core settings");
 	}
+	if (g_state.overlay.ConsumeGameDisplaySettingsSaveRequest()) {
+		SavePspGameDbDisplaySettings();
+	}
 	ExecuteOverlayCommand(g_state.overlay.ConsumeCommand());
 	if (g_state.overlay.ShouldExitGame()) {
 		Log("GBAStation overlay exit requested");
@@ -2079,6 +2177,11 @@ void PpssppRuntime::RunFrame() {
 		g_state.frameOpen = true;
 		if (!g_state.overlay.IsReady()) {
 			g_state.overlay.Init(g_state.draw, g_state.contentPath.c_str(), g_state.log);
+			if (g_state.gameDbLoaded && g_state.gameDbIndex < g_state.gameDbData.size()) {
+				ApplyPspGameDbDisplaySettings(g_state.gameDbData[g_state.gameDbIndex]);
+				ApplyPspGameDbShaderSettings(g_state.gameDbData[g_state.gameDbIndex]);
+				ApplyPspGameDbMaskSettings(g_state.gameDbData[g_state.gameDbIndex]);
+			}
 			RefreshCheatAvailability();
 		}
 	}
@@ -2280,6 +2383,10 @@ void RuntimeAudioPushSamples(const s32 *audio, int numSamples, float volume) {
 	} else {
 		g_state.resampler.Clear();
 	}
+}
+
+void PersistPspGameDbShaderSettings() {
+	SavePspGameDbShaderSettings();
 }
 
 }  // namespace GBAStation

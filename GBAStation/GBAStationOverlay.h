@@ -69,6 +69,20 @@ public:
 	void SetCheatsEnabled(bool enabled);
 	void SetCheatInfo(bool enabled, bool available, const std::vector<CheatMenuEntry> &entries);
 	void ReloadDisplaySettings();
+	// Per-title display values come from the launcher GameDB.  Keep them in the
+	// overlay rather than reloading the global core config whenever the menu is
+	// opened, otherwise one game's aspect/scale leaks into the next game.
+	void SetGameDisplaySettings(int displayMode, const std::string &screenLayout, int internalResolution);
+	void SetGameMaskSettings(bool enabled, const std::string &path);
+	bool IsGameMaskEnabled() const { return gameMaskEnabled_; }
+	const std::string &GameMaskPath() const { return gameMaskPath_; }
+	bool ConsumeGameDisplaySettingsSaveRequest() {
+		const bool requested = gameDisplaySettingsSaveRequested_;
+		gameDisplaySettingsSaveRequested_ = false;
+		return requested;
+	}
+	int GameDisplayModeIndex() const { return static_cast<int>(displaySettings_.mode); }
+	const char *GameScreenLayout() const { return DisplaySizeLabel(displaySettings_.size); }
 
 	bool IsReady() const { return ready_; }
 	bool IsVisible() const { return visible_; }
@@ -105,6 +119,8 @@ private:
 	void ReleaseRAIconTexture();
 	void LoadFocusTexture(Draw::DrawContext *draw);
 	void ReleaseFocusTexture();
+	void LoadMaskTexture(Draw::DrawContext *draw);
+	void ReleaseMaskTexture();
 	void DrawFlowBorder(::ImDrawList *drawList, float x, float y, float w, float h, float thickness);
 	void ExecuteSelection();
 
@@ -119,6 +135,8 @@ private:
 	int settingsSelection_ = 0;
 	bool coreSettingsPage_ = false;
 	bool coreSettingsChanged_ = false;
+	bool gameDisplaySettingsSaveRequested_ = false;
+	bool hasGameDisplaySettings_ = false;
 	Menu menu_ = Menu::Quick;
 	OverlayAction saveStateMode_ = OverlayAction::SaveState;
 	DisplaySettings displaySettings_;
@@ -153,6 +171,9 @@ private:
 	std::string title_;
 	Draw::Texture *raIconTexture_ = nullptr;
 	Draw::Texture *focusTexture_ = nullptr;
+	Draw::Texture *maskTexture_ = nullptr;
+	bool gameMaskEnabled_ = false;
+	std::string gameMaskPath_;
 	ImGuiContext *context_ = nullptr;
 };
 

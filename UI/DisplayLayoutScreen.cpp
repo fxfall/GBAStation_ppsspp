@@ -35,6 +35,7 @@
 #include "UI/DisplayLayoutScreen.h"
 #include "UI/Background.h"
 #include "UI/MiscViews.h"
+#include "UI/SlangShaderScreen.h"
 #include "Core/Config.h"
 #include "Core/ConfigValues.h"
 #include "Core/System.h"
@@ -353,6 +354,14 @@ void DisplayLayoutScreen::CreateViews() {
 	};
 
 	leftColumn->Add(new ItemHeader(gr->T("Postprocessing shaders")));
+
+	// RetroArch slang shaders entry (nds_stub style screen).
+	if (screenManager()->getDrawContext()->GetSupportedShaderLanguages() & ShaderLanguage::GLSL_VULKAN) {
+		Choice *slangButton = leftColumn->Add(new Choice(gr->T("RetroArch Slang Shaders"), new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT)));
+		slangButton->OnClick.Add([&](UI::EventParams &e) {
+			screenManager()->push(new SlangShaderScreen(gr->T("RetroArch Slang Shaders")));
+		});
+	}
 
 	std::set<std::string> alreadyAddedShader;
 	// If there's a single post shader and we're just entering the dialog,

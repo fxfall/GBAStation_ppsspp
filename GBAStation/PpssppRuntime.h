@@ -1,8 +1,16 @@
 #pragma once
 
+#include <string>
+
 #include "GBAStation/GBAStationMain.h"
 
 namespace GBAStation {
+
+// The Slang settings screen lives in PPSSPP's UI module while the launcher
+// GameDB is owned by this runtime.  Keep the bridge intentionally narrow so
+// a preset/parameter change is persisted per game instead of leaking into the
+// user's global PPSSPP configuration.
+void PersistPspGameDbShaderSettings();
 
 class PpssppRuntime final : public CoreRuntime {
 public:

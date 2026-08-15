@@ -25,6 +25,7 @@
 #include "Common/Log.h"
 #include "Common/Data/Format/IniFile.h"
 #include "Common/File/DirListing.h"
+#include "Common/File/FileUtil.h"
 #include "Common/File/VFS/VFS.h"
 #include "Common/GPU/OpenGL/GLFeatures.h"
 #include "Common/GPU/thin3d.h"
@@ -32,10 +33,85 @@
 
 #include "Core/System.h"
 #include "GPU/Common/PostShader.h"
+#include "GPU/Common/Slang/slangp_parser.h"
 
 static std::vector<ShaderInfo> shaderInfo;
 // Okay, not really "post" shaders, but related.
 static std::vector<TextureShaderInfo> textureShaderInfo;
+// Keeps the shared preset alive for all passes of the same .slangp.
+static std::vector<std::shared_ptr<SlangPreset>> slangPresetCache;
+static std::vector<std::string> slangSectionList;
+
+static void ClearSlangCache() {
+	slangPresetCache.clear();
+	slangSectionList.clear();
+}
+
+// Recursively scans a directory for .slangp presets and registers one ShaderInfo
+// per pass. Only the first pass is visible in menus.
+static void LoadSlangShaderInfo(const std::string &directory) {
+	std::vector<File::FileInfo> fileInfo;
+	File::GetFilesInDir(Path(directory), &fileInfo, "slangp:");
+
+	for (const auto &fi : fileInfo) {
+		if (fi.isDirectory) {
+			LoadSlangShaderInfo(fi.fullName.ToString());
+			continue;
+		}
+
+		std::string presetPath = fi.fullName.ToString();
+		auto preset = std::make_shared<SlangPreset>();
+		std::vector<std::string> errors;
+		if (!SlangLoadPreset(presetPath, preset.get(), &errors)) {
+			WARN_LOG(Log::G3D, "Failed to load slang preset %s: %s", presetPath.c_str(), errors.empty() ? "unknown error" : errors[0].c_str());
+			continue;
+		}
+
+		// Section/name = preset file name without extension.
+		std::string title = fi.name;
+		size_t dot = title.find_last_of('.');
+		if (dot != std::string::npos)
+			title = title.substr(0, dot);
+		std::string section = title;
+		if (std::find(slangSectionList.begin(), slangSectionList.end(), section) != slangSectionList.end())
+			continue;
+
+		for (size_t p = 0; p < preset->passes.size(); ++p) {
+			ShaderInfo info{};
+			info.section = section;
+			info.name = section;
+			info.visible = p == 0;
+			info.fragmentShaderFile = Path(preset->passes[p].source);
+			info.isSlang = true;
+			info.slangPassIndex = (int)p;
+			info.slangPreset = preset;
+			info.usePreviousFrame = false;
+
+			// Expose up to 4 parameters to the standard settings UI as well.
+			for (size_t i = 0; i < ARRAY_SIZE(info.settings); ++i) {
+				auto &setting = info.settings[i];
+				setting.name.clear();
+				setting.value = 0.0f;
+				setting.minValue = 0.0f;
+				setting.maxValue = 1.0f;
+				setting.step = 0.01f;
+				if (p == 0 && i < preset->parameters.size()) {
+					const SlangParameter &param = preset->parameters[i];
+					setting.name = param.desc[0] ? param.desc : param.id;
+					setting.value = param.initial;
+					setting.minValue = param.minimum;
+					setting.maxValue = param.maximum;
+					setting.step = param.step;
+				}
+			}
+
+			shaderInfo.push_back(info);
+		}
+
+		slangPresetCache.push_back(preset);
+		slangSectionList.push_back(section);
+	}
+}
 
 static Draw::GPUVendor VendorFromString(const std::string &vendor) {
 	Draw::GPUVendor::VENDOR_UNKNOWN;
@@ -76,6 +152,7 @@ void LoadPostShaderInfo(Draw::DrawContext *draw, const std::vector<Path> &direct
 
 	shaderInfo.clear();
 	textureShaderInfo.clear();
+	ClearSlangCache();
 
 	auto appendShader = [&](const ShaderInfo &info) {
 		auto beginErase = std::remove(shaderInfo.begin(), shaderInfo.end(), info.name);
@@ -245,6 +322,16 @@ void LoadPostShaderInfo(Draw::DrawContext *draw, const std::vector<Path> &direct
 	std::sort(shaderInfo.begin(), shaderInfo.end());
 	std::sort(textureShaderInfo.begin(), textureShaderInfo.end());
 
+	// Scan for RetroArch .slangp presets (one entry per pass, in order).
+	for (size_t d = 0; d < directories.size(); d++) {
+		std::string dir = directories[d].ToString();
+		if (File::IsDirectory(Path(dir)))
+			LoadSlangShaderInfo(dir);
+	}
+
+	// Re-sort, now including the slang entries.
+	std::sort(shaderInfo.begin(), shaderInfo.end());
+
 	ShaderInfo off{};
 	off.visible = true;
 	off.name = "Off";
@@ -299,6 +386,18 @@ const ShaderInfo *GetPostShaderInfo(std::string_view name) {
 std::vector<const ShaderInfo *> GetPostShaderChain(const std::string &name) {
 	std::vector<const ShaderInfo *> backwards;
 	const ShaderInfo *shaderInfo = GetPostShaderInfo(name);
+
+	// Slang presets expand to all their passes.
+	if (shaderInfo && shaderInfo->isSlang) {
+		for (const auto &info : ::shaderInfo) {
+			if (info.section == name && info.isSlang)
+				backwards.push_back(&info);
+		}
+		if (backwards.empty())
+			backwards.push_back(shaderInfo);
+		return backwards;
+	}
+
 	while (shaderInfo) {
 		backwards.push_back(shaderInfo);
 

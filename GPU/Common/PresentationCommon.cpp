@@ -21,6 +21,7 @@
 #include <cstdint>
 #include "Common/GPU/thin3d.h"
 
+#include "Common/Data/Format/PNGLoad.h"
 #include "Common/System/Display.h"
 #include "Common/System/System.h"
 #include "Common/System/OSD.h"
@@ -28,6 +29,7 @@
 #include "Common/VR/PPSSPPVR.h"
 #include "Common/Math/geom2d.h"
 #include "Common/Log.h"
+#include "Common/StringUtils.h"
 #include "Common/TimeUtil.h"
 #include "Core/Config.h"
 #include "Core/ConfigValues.h"
@@ -35,6 +37,7 @@
 #include "Core/HW/Display.h"
 #include "GPU/Common/PostShader.h"
 #include "GPU/Common/PresentationCommon.h"
+#include "GPU/Common/Slang/SlangRuntime.h"
 #include "GPU/GPUState.h"
 #include "Common/GPU/ShaderTranslation.h"
 
@@ -300,16 +303,47 @@ bool PresentationCommon::UpdatePostShader(const DisplayLayoutConfig &config) {
 	for (size_t i = 0; i < shaderInfo.size(); ++i) {
 		const ShaderInfo *next = i + 1 < shaderInfo.size() ? shaderInfo[i + 1] : nullptr;
 		Draw::Pipeline *postPipeline = nullptr;
+
+		// Pre-compile slang passes. Note: passes must be compiled in order, since
+		// earlier passes may fill in aliases that later passes reflect on.
+		if (shaderInfo[i]->isSlang) {
+			std::string cacheKey = shaderInfo[i]->section + "::" + std::to_string(shaderInfo[i]->slangPassIndex);
+			if (slangCompiledMap_.find(cacheKey) == slangCompiledMap_.end()) {
+				std::shared_ptr<SlangPreset> preset = shaderInfo[i]->slangPreset;
+				slangPresetMap_[cacheKey] = preset;
+				auto compiled = std::make_shared<SlangPassCompiled>();
+				if (preset && !SlangProcess(preset.get(), shaderInfo[i]->slangPassIndex, compiled.get())) {
+					ERROR_LOG(Log::FrameBuf, "Failed to compile slang pass %d of preset %s", shaderInfo[i]->slangPassIndex, shaderInfo[i]->name.c_str());
+					compiled.reset();
+				}
+				slangCompiledMap_[cacheKey] = compiled;
+			}
+		}
+
 		if (!BuildPostShader(config, shaderInfo[i], next, &postPipeline)) {
 			DestroyPostShader();
 			return false;
 		}
 		_dbg_assert_(postPipeline);
 		postShaderPipelines_.push_back(postPipeline);
-		postShaderInfo_.push_back(*shaderInfo[i]);
-		if (shaderInfo[i]->usePreviousFrame) {
+		ShaderInfo infoCopy = *shaderInfo[i];
+		if (infoCopy.isSlang) {
+			std::string cacheKey = infoCopy.section + "::" + std::to_string(infoCopy.slangPassIndex);
+			auto citr = slangCompiledMap_.find(cacheKey);
+			if (citr != slangCompiledMap_.end())
+				infoCopy.slangCompiled = citr->second;
+			// Shaders using OriginalHistory need the previous-frame mechanism.
+			if (infoCopy.slangCompiled) {
+				for (int t = 0; t < infoCopy.slangCompiled->semantics.texture_count; t++) {
+					if (infoCopy.slangCompiled->semantics.textures[t].semantic == SLANG_TEXTURE_SEMANTIC_ORIGINAL_HISTORY)
+						infoCopy.usePreviousFrame = true;
+				}
+			}
+		}
+		postShaderInfo_.push_back(infoCopy);
+		if (infoCopy.usePreviousFrame) {
 			usePreviousFrame = true;
-			usePreviousAtOutputResolution = shaderInfo[i]->outputResolution;
+			usePreviousAtOutputResolution = infoCopy.outputResolution;
 		}
 	}
 
@@ -338,6 +372,9 @@ bool PresentationCommon::UpdatePostShader(const DisplayLayoutConfig &config) {
 
 bool PresentationCommon::CompilePostShader(const ShaderInfo *shaderInfo, Draw::Pipeline **outPipeline) const {
 	_assert_(shaderInfo);
+
+	if (shaderInfo->isSlang)
+		return CompileSlangPass(shaderInfo, outPipeline);
 
 	std::string vsSourceGLSL = ReadShaderSrc(shaderInfo->vertexShaderFile);
 	std::string fsSourceGLSL = ReadShaderSrc(shaderInfo->fragmentShaderFile);
@@ -380,6 +417,88 @@ bool PresentationCommon::CompilePostShader(const ShaderInfo *shaderInfo, Draw::P
 
 	if (!pipeline)
 		return false;
+
+	*outPipeline = pipeline;
+	return true;
+}
+
+// Creates a pipeline whose input layout matches the RetroArch slang convention:
+// location 0 = position (vec3), location 1 = texcoord (vec2). The vertex buffer
+// is the same one used for the regular post shaders.
+Draw::Pipeline *PresentationCommon::CreateSlangPipeline(std::vector<Draw::ShaderModule *> shaders, const UniformBufferDesc *uniformDesc) const {
+	using namespace Draw;
+
+	InputLayoutDesc inputDesc = {
+		sizeof(Vertex),
+		{
+			{ SEM_POSITION, DataFormat::R32G32B32_FLOAT, 0 },
+			{ SEM_TEXCOORD0, DataFormat::R32G32_FLOAT, 12 },
+		},
+	};
+
+	InputLayout *inputLayout = draw_->CreateInputLayout(inputDesc);
+	DepthStencilState *depth = draw_->CreateDepthStencilState({ false, false, Comparison::LESS });
+	BlendState *blendstateOff = draw_->CreateBlendState({ false, 0xF });
+	RasterState *rasterNoCull = draw_->CreateRasterState({});
+
+	PipelineDesc pipelineDesc{ Primitive::TRIANGLE_STRIP, shaders, inputLayout, depth, blendstateOff, rasterNoCull, uniformDesc };
+	Pipeline *pipeline = draw_->CreateGraphicsPipeline(pipelineDesc, "slang-presentation");
+
+	inputLayout->Release();
+	depth->Release();
+	blendstateOff->Release();
+	rasterNoCull->Release();
+
+	return pipeline;
+}
+
+bool PresentationCommon::CompileSlangPass(const ShaderInfo *shaderInfo, Draw::Pipeline **outPipeline) const {
+	_assert_(shaderInfo);
+	if (!shaderInfo->isSlang)
+		return false;
+
+	std::string cacheKey = shaderInfo->section + "::" + std::to_string(shaderInfo->slangPassIndex);
+	auto itr = slangCompiledMap_.find(cacheKey);
+	if (itr == slangCompiledMap_.end() || !itr->second) {
+		std::string errorString = StringFromFormat("Slang pass %s not compiled (shader compile failed).", shaderInfo->name.c_str());
+		ERROR_LOG(Log::FrameBuf, "%s", errorString.c_str());
+		ShowPostShaderError(errorString);
+		return false;
+	}
+	const std::shared_ptr<SlangPassCompiled> &compiled = itr->second;
+
+	// Slang outputs Vulkan GLSL 450. Only the Vulkan backend is supported for now.
+	if (lang_ != ShaderLanguage::GLSL_VULKAN) {
+		std::string errorString = StringFromFormat("Slang shaders require the Vulkan backend. Current backend: %s", ShaderLanguageAsString(lang_));
+		ERROR_LOG(Log::FrameBuf, "%s", errorString.c_str());
+		ShowPostShaderError(errorString);
+		return false;
+	}
+
+	Draw::ShaderModule *vs = draw_->CreateShaderModule(ShaderStage::Vertex, lang_, (const uint8_t *)compiled->vertexGLSL.c_str(), compiled->vertexGLSL.size(), "slang-post-vs");
+	Draw::ShaderModule *fs = draw_->CreateShaderModule(ShaderStage::Fragment, lang_, (const uint8_t *)compiled->fragmentGLSL.c_str(), compiled->fragmentGLSL.size(), "slang-post-fs");
+
+	if (!vs || !fs) {
+		if (vs)
+			vs->Release();
+		if (fs)
+			fs->Release();
+		ShowPostShaderError("Failed to create slang shader modules (see log).");
+		return false;
+	}
+
+	UniformBufferDesc slangUBODesc{};
+	slangUBODesc.uniformBufferSize = std::max(compiled->semantics.cbuffers[SLANG_CBUFFER_UBO].size, (unsigned)16);
+
+	Draw::Pipeline *pipeline = CreateSlangPipeline({ vs, fs }, &slangUBODesc);
+
+	fs->Release();
+	vs->Release();
+
+	if (!pipeline) {
+		ShowPostShaderError("Failed to create slang pipeline.");
+		return false;
+	}
 
 	*outPipeline = pipeline;
 	return true;
@@ -580,8 +699,48 @@ void PresentationCommon::DestroyPostShader() {
 	DoReleaseVector(postShaderPipelines_);
 	DoReleaseVector(postShaderFramebuffers_);
 	DoReleaseVector(previousFramebuffers_);
+	for (auto &[id, tex] : lutTextures_)
+		DoRelease(tex);
+	lutTextures_.clear();
 	postShaderInfo_.clear();
 	postShaderFBOUsage_.clear();
+	slangCompiledMap_.clear();
+	slangPresetMap_.clear();
+}
+
+Draw::Texture *PresentationCommon::GetLutTexture(const std::shared_ptr<SlangPreset> &preset, unsigned index) const {
+	if (!preset || index >= preset->luts.size())
+		return nullptr;
+	const SlangLut &lut = preset->luts[index];
+
+	auto itr = lutTextures_.find(lut.id);
+	if (itr != lutTextures_.end())
+		return itr->second;
+
+	int w = 0, h = 0;
+	unsigned char *data = nullptr;
+	if (!pngLoad(lut.path.c_str(), &w, &h, &data) || !data) {
+		WARN_LOG(Log::FrameBuf, "Failed to load slang LUT texture '%s'", lut.path.c_str());
+		lutTextures_[lut.id] = nullptr;
+		return nullptr;
+	}
+
+	Draw::TextureDesc desc{
+		Draw::TextureType::LINEAR2D,
+		Draw::DataFormat::R8G8B8A8_UNORM,
+		w, h, 1, 1,
+		false,
+		Draw::TextureSwizzle::DEFAULT,
+		"slang-lut",
+		{ data },
+		nullptr,
+	};
+	Draw::Texture *tex = draw_->CreateTexture(desc);
+	free(data);
+	if (!tex)
+		WARN_LOG(Log::FrameBuf, "Failed to create slang LUT texture '%s'", lut.path.c_str());
+	lutTextures_[lut.id] = tex;
+	return tex;
 }
 
 void PresentationCommon::DestroyStereoShader() {
@@ -793,7 +952,141 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 	// Grab the previous framebuffer early so we can change previousIndex_ when we want.
 	Draw::Framebuffer *previousFramebuffer = previousFramebuffers_.empty() ? nullptr : previousFramebuffers_[previousIndex_];
 
+	// Renders one slang pass: binds textures according to the reflected semantics,
+	// fills the reflected UBO and draws.
+	const auto performSlangPass = [&](const ShaderInfo *shaderInfo, Draw::Framebuffer *postShaderFramebuffer, Draw::Pipeline *postShaderPipeline, int vertsOffset) {
+		_dbg_assert_(shaderInfo->slangCompiled);
+		const pass_semantics_t &semantics = shaderInfo->slangCompiled->semantics;
+
+		int pw, ph;
+		draw_->GetFramebufferDimensions(postShaderFramebuffer, &pw, &ph);
+
+		SlangRuntimeContext ctx;
+		ctx.passWidth = pw;
+		ctx.passHeight = ph;
+		ctx.finalWidth = (int)rc_.w;
+		ctx.finalHeight = (int)rc_.h;
+		ctx.originalWidth = srcWidth_;
+		ctx.originalHeight = srcHeight_;
+		int flipCount = __DisplayGetFlipCount();
+		ctx.frameCount = (float)flipCount;
+		double now = time_now_d();
+		ctx.frameTimeDelta = lastSlangTime_ == 0.0 ? 0.0f : (float)(now - lastSlangTime_);
+		lastSlangTime_ = now;
+		ctx.fps = 60.0f;
+		ctx.aspect = 480.0f / 272.0f;
+
+		for (int t = 0; t < semantics.texture_count; t++) {
+			const texture_sem_t &tex = semantics.textures[t];
+			int slot = SlangBindingToSlot(tex.binding);
+			if (slot < 0 || slot >= (int)Draw::MAX_TEXTURE_SLOTS) {
+				WARN_LOG(Log::FrameBuf, "Slang texture binding %u out of range (max %d)", tex.binding, Draw::MAX_TEXTURE_SLOTS);
+				continue;
+			}
+
+			Draw::Texture *texObj = nullptr;
+			Draw::Framebuffer *fbObj = nullptr;
+			int w = 0, h = 0;
+
+			switch (tex.semantic) {
+			case SLANG_TEXTURE_SEMANTIC_SOURCE:
+				if (postShaderOutput_) {
+					fbObj = postShaderOutput_;
+					draw_->GetFramebufferDimensions(fbObj, &w, &h);
+				} else if (srcFramebuffer_) {
+					fbObj = srcFramebuffer_;
+					w = srcWidth_;
+					h = srcHeight_;
+				} else if (srcTexture_) {
+					texObj = srcTexture_;
+					w = srcWidth_;
+					h = srcHeight_;
+				}
+				break;
+			case SLANG_TEXTURE_SEMANTIC_ORIGINAL:
+				if (srcFramebuffer_) {
+					fbObj = srcFramebuffer_;
+				} else if (srcTexture_) {
+					texObj = srcTexture_;
+				}
+				w = srcWidth_;
+				h = srcHeight_;
+				break;
+			case SLANG_TEXTURE_SEMANTIC_PASS_OUTPUT:
+				if (tex.index < postShaderFramebuffers_.size()) {
+					fbObj = postShaderFramebuffers_[tex.index];
+					draw_->GetFramebufferDimensions(fbObj, &w, &h);
+				}
+				break;
+			case SLANG_TEXTURE_SEMANTIC_ORIGINAL_HISTORY:
+				if (previousFramebuffer) {
+					fbObj = previousFramebuffer;
+					draw_->GetFramebufferDimensions(fbObj, &w, &h);
+				}
+				break;
+			case SLANG_TEXTURE_SEMANTIC_USER:
+				texObj = GetLutTexture(shaderInfo->slangPreset, tex.index);
+				if (texObj) {
+					w = texObj->Width();
+					h = texObj->Height();
+				}
+				break;
+			case SLANG_TEXTURE_SEMANTIC_PASS_FEEDBACK:
+				// Not supported yet (requires per-pass frame history).
+				WARN_LOG(Log::FrameBuf, "Slang PassFeedback texture not supported yet.");
+				break;
+			default:
+				break;
+			}
+
+			if (texObj)
+				draw_->BindTexture(slot, texObj);
+			else if (fbObj)
+				draw_->BindFramebufferAsTexture(fbObj, slot, Draw::Aspect::COLOR_BIT, 0);
+			else
+				WARN_LOG(Log::FrameBuf, "Slang texture %s (%d#%d) has no source.", tex.id, (int)tex.semantic, tex.index);
+
+			Draw::SamplerState *sampler = tex.filter == 0 ? samplerLinear_ : samplerNearest_;
+			draw_->BindSamplerStates(slot, 1, &sampler);
+
+			if (tex.semantic >= 0 && tex.semantic < SLANG_NUM_TEXTURE_SEMANTICS && tex.index < 8) {
+				ctx.textureSizes[tex.semantic * 8 + tex.index][0] = (float)w;
+				ctx.textureSizes[tex.semantic * 8 + tex.index][1] = (float)h;
+				ctx.textureSizes[tex.semantic * 8 + tex.index][2] = w > 0 ? 1.0f / w : 0.0f;
+				ctx.textureSizes[tex.semantic * 8 + tex.index][3] = h > 0 ? 1.0f / h : 0.0f;
+			}
+		}
+
+		// Parameter values (settings from the UI config, defaults from the preset).
+		std::vector<float> paramValues;
+		if (shaderInfo->slangPreset) {
+			paramValues.resize(shaderInfo->slangPreset->parameters.size());
+			for (size_t i = 0; i < paramValues.size(); ++i) {
+				paramValues[i] = GetShaderSettingValue(shaderInfo, (int)i, StringFromFormat("SettingCurrentValue%d", (int)i + 1).c_str());
+			}
+			ctx.paramValues = paramValues.data();
+			ctx.numParams = (int)paramValues.size();
+		}
+
+		std::vector<uint8_t> ubo(std::max((size_t)16, (size_t)semantics.cbuffers[SLANG_CBUFFER_UBO].size));
+		SlangFillUniformBuffer(semantics, ctx, ubo.data(), ubo.size());
+
+		draw_->BindPipeline(postShaderPipeline);
+		draw_->UpdateDynamicUniformBuffer(ubo.data(), ubo.size());
+
+		draw_->BindVertexBuffer(vdata_, vertsOffset);
+		draw_->Draw(4, 0);
+
+		postShaderOutput_ = postShaderFramebuffer;
+		lastWidth = pw;
+		lastHeight = ph;
+	};
+
 	const auto performShaderPass = [&](const ShaderInfo *shaderInfo, Draw::Framebuffer *postShaderFramebuffer, Draw::Pipeline *postShaderPipeline, int vertsOffset) {
+		if (shaderInfo->isSlang) {
+			performSlangPass(shaderInfo, postShaderFramebuffer, postShaderPipeline, vertsOffset);
+			return;
+		}
 		if (postShaderOutput_) {
 			draw_->BindFramebufferAsTexture(postShaderOutput_, 0, Draw::Aspect::COLOR_BIT, 0);
 		} else {

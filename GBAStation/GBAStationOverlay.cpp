@@ -558,6 +558,29 @@ void Overlay::ReleaseFocusTexture() {
 	}
 }
 
+void Overlay::LoadMaskTexture(Draw::DrawContext *draw) {
+	if (maskTexture_ || !draw || gameMaskPath_.empty()) {
+		return;
+	}
+	std::vector<unsigned char> imageData;
+	if (!ReadFileBytes(gameMaskPath_.c_str(), &imageData)) {
+		LogMessage(log_, "GBAStation overlay mask not found path=%s", gameMaskPath_.c_str());
+		return;
+	}
+	maskTexture_ = CreateTextureFromFileData(draw, imageData.data(), imageData.size(),
+		ImageFileType::PNG, false, gameMaskPath_.c_str());
+	if (!maskTexture_) {
+		LogMessage(log_, "GBAStation overlay mask decode failed path=%s", gameMaskPath_.c_str());
+	}
+}
+
+void Overlay::ReleaseMaskTexture() {
+	if (maskTexture_) {
+		maskTexture_->Release();
+		maskTexture_ = nullptr;
+	}
+}
+
 void Overlay::DrawFlowBorder(ImDrawList *drawList, float x, float y, float w, float h, float thickness) {
 	const float rounding = 0.0f;
 	if (!focusTexture_) {
@@ -615,6 +638,7 @@ void Overlay::Shutdown() {
 	}
 	ReleaseRAIconTexture();
 	ReleaseFocusTexture();
+	ReleaseMaskTexture();
 	for (SlotThumb &thumb : slotThumbs_) {
 		if (thumb.tex) {
 			thumb.tex->Release();
@@ -674,7 +698,8 @@ void Overlay::SetVisible(bool visible) {
 	cheatHorizontalNavDir_ = 0;
 	if (visible_) {
 		TranslationManager::Instance().Init(log_);
-		displaySettings_ = LoadPpssppDisplaySettings(log_);
+		if (!hasGameDisplaySettings_)
+			displaySettings_ = LoadPpssppDisplaySettings(log_);
 	} else {
 		cheatsLoading_ = false;
 		cheatsLoadCommandSent_ = false;
@@ -725,6 +750,42 @@ void Overlay::SetCheatInfo(bool enabled, bool available, const std::vector<Cheat
 
 void Overlay::ReloadDisplaySettings() {
 	displaySettings_ = LoadPpssppDisplaySettings(log_);
+}
+
+void Overlay::SetGameDisplaySettings(int displayMode, const std::string &screenLayout, int internalResolution) {
+	hasGameDisplaySettings_ = true;
+	if (internalResolution >= 0)
+		g_Config.iInternalResolution = std::clamp(internalResolution, 0, 10);
+
+	if (displayMode == static_cast<int>(DisplayMode::Integer))
+		displaySettings_.mode = DisplayMode::Integer;
+	else if (displayMode == static_cast<int>(DisplayMode::Display))
+		displaySettings_.mode = DisplayMode::Display;
+
+	// GameDB deliberately stores the shared launcher spelling used by the
+	// other cores (ndsScreenLayout).  PPSSPP maps it to its own display enum.
+	if (screenLayout == "Stretch") displaySettings_.size = DisplaySize::Stretch;
+	else if (screenLayout == "4:3") displaySettings_.size = DisplaySize::_4_3;
+	else if (screenLayout == "16:9") displaySettings_.size = DisplaySize::_16_9;
+	else if (screenLayout == "Original" || screenLayout == "原比例") displaySettings_.size = DisplaySize::Original;
+	else if (screenLayout == "1x") displaySettings_.size = DisplaySize::_1x;
+	else if (screenLayout == "2x") displaySettings_.size = DisplaySize::_2x;
+	else if (screenLayout == "3x") displaySettings_.size = DisplaySize::_3x;
+	else if (screenLayout == "4x") displaySettings_.size = DisplaySize::_4x;
+	else if (screenLayout == "Auto") displaySettings_.size = DisplaySize::Auto;
+
+	displaySettings_ = NormalizePpssppDisplaySettingsForCurrentMode(displaySettings_);
+	ApplyPpssppDisplaySettings(displaySettings_);
+}
+
+void Overlay::SetGameMaskSettings(bool enabled, const std::string &path) {
+	gameMaskEnabled_ = enabled;
+	if (gameMaskPath_ == path) {
+		return;
+	}
+	gameMaskPath_ = path;
+	ReleaseMaskTexture();
+	LoadMaskTexture(draw_);
 }
 
 OverlayCommand Overlay::ConsumeCommand() {
@@ -842,6 +903,7 @@ void Overlay::CycleSetting(int direction) {
 	if (settingsSelection_ == 0) {
 		g_Config.iInternalResolution = std::clamp(g_Config.iInternalResolution + direction, 0, 5);
 		coreSettingsChanged_ = true;
+		gameDisplaySettingsSaveRequested_ = true;
 		return;
 	}
 	if (settingsSelection_ == 1) {
@@ -849,6 +911,7 @@ void Overlay::CycleSetting(int direction) {
 		displaySettings_.mode = displaySettings_.mode == DisplayMode::Integer ? DisplayMode::Display : DisplayMode::Integer;
 		displaySettings_.size = displaySettings_.mode == DisplayMode::Integer ? DisplaySize::Auto : DisplaySize::_16_9;
 		ApplyDisplaySettings(true);
+		gameDisplaySettingsSaveRequested_ = true;
 		return;
 	}
 	if (settingsSelection_ == 2) {
@@ -862,6 +925,7 @@ void Overlay::CycleSetting(int direction) {
 				(int)(sizeof(kAspectDisplaySizes) / sizeof(kAspectDisplaySizes[0])), direction);
 		}
 		ApplyDisplaySettings(true);
+		gameDisplaySettingsSaveRequested_ = true;
 		return;
 	}
 	switch (settingsSelection_) {
@@ -1782,7 +1846,8 @@ void Overlay::Render(Draw::DrawContext *draw) {
 
 	const bool hasRAAlerts = !RetroAchievements().Notifications().empty();
 	const bool showHud = GetPspShowFps() || GetPspFastForwardActive();
-	if (!visible_ && !hasRAAlerts && !showHud) {
+	const bool showMask = gameMaskEnabled_ && !gameMaskPath_.empty();
+	if (!visible_ && !hasRAAlerts && !showHud && !showMask) {
 		return;
 	}
 
@@ -1803,6 +1868,13 @@ void Overlay::Render(Draw::DrawContext *draw) {
 
 	ImGui_ImplThin3d_NewFrame(draw, ComputeOrthoMatrix(orthoW, orthoH, draw->GetDeviceCaps().coordConvention));
 	ImGui::NewFrame();
+	if (showMask) {
+		LoadMaskTexture(draw);
+		if (maskTexture_) {
+			const ImTextureID maskId = ImGui_ImplThin3d_AddTextureTemp(maskTexture_);
+			ImGui::GetBackgroundDrawList()->AddImage(maskId, ImVec2(0, 0), ImVec2(width, height));
+		}
+	}
 	DrawHud(ImGui::GetForegroundDrawList(), width, height);
 	if (visible_) {
 		DrawUI(width, height, io.DeltaTime);

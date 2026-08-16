@@ -83,6 +83,14 @@ SlangWrapType ParseWrap(const std::string &v) {
 	return SlangWrapType::EDGE;
 }
 
+SlangScaleType ParseScaleType(const std::string &v) {
+	if (v == "viewport")
+		return SlangScaleType::VIEWPORT;
+	if (v == "absolute")
+		return SlangScaleType::ABSOLUTE;
+	return SlangScaleType::SOURCE;
+}
+
 std::string DirOf(const std::string &path) {
 	size_t slash = path.find_last_of("/\\");
 	if (slash == std::string::npos)
@@ -137,6 +145,16 @@ bool SlangLoadPreset(const std::string &presetPath, SlangPreset *preset, std::ve
 		return false;
 	};
 
+	// The standard slang preset keys are suffixed by the pass number
+	// (filter_linear0, alias0, ...).  A few old PPSSPP experiments used
+	// shader0_filter_linear instead, so accept both forms while preferring the
+	// standard spelling.
+	auto findPass = [&](const std::string &key, int pass, std::string *out) -> bool {
+		if (find(key + std::to_string(pass), out))
+			return true;
+		return find(StringFromFormat("shader%d_%s", pass, key.c_str()), out);
+	};
+
 	// Basic sanity: need a shaders count.
 	std::string shadersStr;
 	if (!find("shaders", &shadersStr)) {
@@ -152,6 +170,7 @@ bool SlangLoadPreset(const std::string &presetPath, SlangPreset *preset, std::ve
 	preset->passes.clear();
 	preset->parameters.clear();
 	preset->luts.clear();
+	preset->historySize = 0;
 
 	std::string id;
 
@@ -169,16 +188,35 @@ bool SlangLoadPreset(const std::string &presetPath, SlangPreset *preset, std::ve
 		if (!path.empty() && (path[0] == '/' || (path.size() > 2 && path[1] == ':')))
 			pass.source = path;
 
-		if (find(prefix + "_filter_linear", &id))
+		if (findPass("filter_linear", i, &id))
 			pass.filterLinear = ParseBool(id);
-		if (find(prefix + "_wrap_mode", &id))
+		if (findPass("wrap_mode", i, &id))
 			pass.wrap = ParseWrap(id);
-		if (find(prefix + "_float_framebuffer", &id))
+		if (findPass("float_framebuffer", i, &id))
 			pass.fpFbo = ParseBool(id);
-		if (find(prefix + "_srgb_framebuffer", &id))
+		if (findPass("srgb_framebuffer", i, &id))
 			pass.srgbFbo = ParseBool(id);
-		if (find(prefix + "_alias", &id))
+		if (findPass("alias", i, &id))
 			pass.alias = id;
+		if (findPass("mipmap_input", i, &id))
+			pass.mipmapInput = ParseBool(id);
+
+		std::string scale;
+		if (!findPass("scale_type_x", i, &scale))
+			findPass("scale_type", i, &scale);
+		pass.scaleX = ParseScaleType(scale);
+		scale.clear();
+		if (!findPass("scale_type_y", i, &scale))
+			findPass("scale_type", i, &scale);
+		pass.scaleY = ParseScaleType(scale);
+		if (findPass("scale_x", i, &id))
+			pass.scaleXValue = ParseFloat(id, 1.0f);
+		else if (findPass("scale", i, &id))
+			pass.scaleXValue = ParseFloat(id, 1.0f);
+		if (findPass("scale_y", i, &id))
+			pass.scaleYValue = ParseFloat(id, 1.0f);
+		else if (findPass("scale", i, &id))
+			pass.scaleYValue = ParseFloat(id, 1.0f);
 
 		preset->passes.push_back(pass);
 	}
@@ -188,6 +226,10 @@ bool SlangLoadPreset(const std::string &presetPath, SlangPreset *preset, std::ve
 	if (find("parameters", &id)) {
 		SplitSemicolon(id, &paramNames);
 		for (auto &name : paramNames) {
+			// Shader source is deliberately not opened while the preset list is
+			// scanned. Published presets can contain optional includes or pass-only
+			// parameters; those are resolved when the corresponding pass compiles.
+			// Keeping the public values here lets SlangProcess apply them later.
 			SlangParameter param{};
 			strncpy(param.id, name.c_str(), sizeof(param.id) - 1);
 			strncpy(param.desc, name.c_str(), sizeof(param.desc) - 1);
@@ -195,18 +237,13 @@ bool SlangLoadPreset(const std::string &presetPath, SlangPreset *preset, std::ve
 			param.minimum = 0.0f;
 			param.maximum = 1.0f;
 			param.step = 0.01f;
-
 			std::string v;
-			if (find(name, &v))
-				param.initial = ParseFloat(v, 0.0f);
-			if (find(name + "_min", &v))
-				param.minimum = ParseFloat(v, 0.0f);
-			if (find(name + "_max", &v))
-				param.maximum = ParseFloat(v, 1.0f);
-			if (find(name + "_step", &v))
-				param.step = ParseFloat(v, 0.01f);
-			param.current = param.initial;
-
+			if (find(name, &v)) {
+				param.current = ParseFloat(v, 0.0f);
+				param.hasPresetValue = true;
+			} else {
+				param.current = param.initial;
+			}
 			preset->parameters.push_back(param);
 		}
 	}
@@ -222,6 +259,8 @@ bool SlangLoadPreset(const std::string &presetPath, SlangPreset *preset, std::ve
 			SlangLut lut;
 			lut.id = name;
 			lut.path = baseDir + path;
+			if (!path.empty() && (path[0] == '/' || (path.size() > 2 && path[1] == ':')))
+				lut.path = path;
 			std::string filterId;
 			if (find(name + "_filter_linear", &filterId))
 				lut.filterLinear = ParseBool(filterId);

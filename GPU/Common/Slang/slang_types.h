@@ -63,6 +63,14 @@ enum class SlangWrapType {
 	EDGE,
 };
 
+// The size of a pass render target.  These are the names used by the
+// RetroArch .slangp format.
+enum class SlangScaleType {
+	SOURCE,
+	VIEWPORT,
+	ABSOLUTE,
+};
+
 // Textures with built-in meaning.
 enum SlangTextureSemantic {
 	// The input texture to the filter chain. Canonical name: "Original".
@@ -170,16 +178,22 @@ struct SlangParameter {
 	float maximum;
 	float step;
 	float current;
+	bool hasPresetValue = false;
 };
 
 struct SlangPass {
 	std::string source;    // path to the .slang file
 	std::string alias;
+	SlangScaleType scaleX = SlangScaleType::SOURCE;
+	SlangScaleType scaleY = SlangScaleType::SOURCE;
+	float scaleXValue = 1.0f;
+	float scaleYValue = 1.0f;
 	bool srgbFbo = false;
 	bool fpFbo = false;
 	bool feedback = false;
+	bool mipmapInput = false;
 	SlangWrapType wrap = SlangWrapType::EDGE;
-	bool filterLinear = true;
+	bool filterLinear = false;
 };
 
 struct SlangLut {

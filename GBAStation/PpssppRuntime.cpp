@@ -52,6 +52,7 @@
 #include "Core/Screenshot.h"
 #include "GPU/Common/FramebufferManagerCommon.h"
 #include "GPU/Common/PostShader.h"
+#include "GPU/GPU.h"
 #include "Core/Screenshot.h"
 #include "Core/System.h"
 #include "Core/Util/PathUtil.h"
@@ -1416,18 +1417,50 @@ void ApplyPspGameDbDisplaySettings(const nlohmann::json &item) {
 }
 
 void ApplyPspGameDbShaderSettings(const nlohmann::json &item) {
-	// Slang presets are registered after the graphics host starts.  Unknown or
-	// removed presets are ignored, leaving the regular global setting intact.
-	if (!JsonBoolOr(item, "shaderEnabled"))
+	// Keep the selected filter separately from its enabled state, so the menu
+	// switch can disable it without forgetting the choice needed to restore it.
+	const bool enabled = JsonBoolOr(item, "shaderEnabled");
+	const std::string preset = NormalizeGameDbPath(JsonStringOr(item, "shaderPath"));
+	if (!preset.empty() && preset.size() >= 7 && preset.compare(preset.size() - 7, 7, ".slangp") == 0) {
+		std::string error;
+		if (!RegisterSlangPresetPath(preset, &error))
+			Log("GBAStation Slang GameDB register failed file=%s error=%s", preset.c_str(), error.c_str());
+		else
+			ReloadAllPostShaderInfo(nullptr);
+	}
+	if (!enabled) {
+		g_Config.vPostShaderNames.clear();
+		if (g_state.overlay.IsReady())
+			g_state.overlay.SetGameShaderSettings(false, preset);
 		return;
-	const std::string preset = JsonStringOr(item, "shaderPath");
-	if (preset.empty())
+	}
+	if (preset.empty()) {
+		g_Config.vPostShaderNames.clear();
+		if (g_state.overlay.IsReady())
+			g_state.overlay.SetGameShaderSettings(true, "");
 		return;
+	}
 	const ShaderInfo *info = GetPostShaderInfo(preset);
-	if (!info || !info->isSlang)
+	// The GameDB stores the user-facing built-in filter name.  Accept the old
+	// section identifier as well so existing entries migrate on their next save.
+	if (!info) {
+		for (const ShaderInfo &candidate : GetAllPostShaderInfo()) {
+			if (!candidate.isSlang && candidate.name == preset) {
+				info = &candidate;
+				break;
+			}
+		}
+	}
+	if (!info || info->section == "Off") {
+		g_Config.vPostShaderNames.clear();
+		if (g_state.overlay.IsReady())
+			g_state.overlay.SetGameShaderSettings(true, preset);
 		return;
+	}
 	g_Config.vPostShaderNames.assign(1, info->section);
 	FixPostShaderOrder(&g_Config.vPostShaderNames);
+	if (g_state.overlay.IsReady())
+		g_state.overlay.SetGameShaderSettings(true, info->section);
 	const auto names = item.value("shaderParaNames", std::vector<std::string>{});
 	const auto values = item.value("shaderParaValues", std::vector<float>{});
 	for (size_t i = 0; i < names.size() && i < values.size(); ++i) {
@@ -1481,28 +1514,26 @@ void SavePspGameDbShaderSettings() {
 	auto &item = g_state.gameDbData[g_state.gameDbIndex];
 	if (!item.is_object())
 		return;
-	const ShaderInfo *slang = nullptr;
-	for (const std::string &name : g_Config.vPostShaderNames) {
-		const ShaderInfo *candidate = GetPostShaderInfo(name);
-		if (candidate && candidate->isSlang) {
-			slang = candidate;
-			break;
-		}
-	}
-	item["shaderEnabled"] = slang != nullptr;
-	item["shaderPath"] = slang ? NormalizeGameDbPath(slang->section) : std::string();
+	const std::string section = g_state.overlay.GameShaderSection();
+	const ShaderInfo *shader = section.empty() ? nullptr : GetPostShaderInfo(section);
+	const bool validShader = shader && shader->section != "Off";
+	item["shaderEnabled"] = g_state.overlay.IsGameShaderEnabled();
+	// This existing schema string now stores the selected built-in filter's
+	// display name, rather than a custom shader file path.
+	item["shaderPath"] = validShader ? shader->name : std::string();
 	// The shared schema reserves this legacy field for launcher parameter files;
 	// Slang parameters are stored in the arrays below.
 	item["shaderParaPath"] = "";
 	std::vector<std::string> names;
 	std::vector<float> values;
-	if (slang && slang->slangPreset) {
-		for (size_t i = 0; i < slang->slangPreset->parameters.size(); ++i) {
-			const SlangParameter &param = slang->slangPreset->parameters[i];
-			names.emplace_back(param.id);
-			const std::string key = StringFromFormat("%sSettingCurrentValue%u", slang->section.c_str(), (unsigned)i + 1);
+	if (shader) {
+		for (size_t i = 0; i < ARRAY_SIZE(shader->settings); ++i) {
+			if (shader->settings[i].name.empty())
+				continue;
+			names.emplace_back(shader->settings[i].name);
+			const std::string key = StringFromFormat("%sSettingCurrentValue%u", shader->section.c_str(), (unsigned)i + 1);
 			auto it = g_Config.mPostShaderSetting.find(key);
-			values.push_back(it == g_Config.mPostShaderSetting.end() ? param.current : it->second);
+			values.push_back(it == g_Config.mPostShaderSetting.end() ? shader->settings[i].value : it->second);
 		}
 	}
 	item["shaderParaNames"] = std::move(names);
@@ -1580,7 +1611,7 @@ void SyncPspGameDbShaderSettings() {
 	const std::string path = NormalizeGameDbPath(JsonStringOr(source, "shaderPath"));
 	const auto names = source.value("shaderParaNames", std::vector<std::string>{});
 	const auto values = source.value("shaderParaValues", std::vector<float>{});
-	SyncPspGameDb("Slang shader settings", [=](nlohmann::json &item) {
+	SyncPspGameDb("post shader settings", [=](nlohmann::json &item) {
 		item["shaderEnabled"] = enabled;
 		item["shaderPath"] = path;
 		item["shaderParaPath"] = "";
@@ -2603,6 +2634,15 @@ void PersistPspGameDbShaderSettings() {
 	SavePspGameDbShaderSettings();
 }
 
+void NotifyPspGpuConfigChanged() {
+	const char *first = g_Config.vPostShaderNames.empty() ? "<off>" : g_Config.vPostShaderNames.front().c_str();
+	Log("GBAStation GPU config changed postShaderCount=%u first=%s gpu=%p",
+		(unsigned)g_Config.vPostShaderNames.size(), first, (void *)gpu);
+	if (gpu) {
+		gpu->NotifyConfigChanged();
+	}
+}
+
 }  // namespace GBAStation
 
 void NativeFrame(GraphicsContext *) {
@@ -2704,7 +2744,27 @@ bool System_GetPropertyBool(SystemProperty prop) {
 void System_Notify(SystemNotification) {
 }
 
-void System_PostUIMessage(UIMessage, std::string_view) {
+void System_PostUIMessage(UIMessage message, std::string_view) {
+	// The standalone GBAStation host has no NativeApp message loop.  PPSSPP UI
+	// screens normally use this route for dynamic post-processing changes, so
+	// forwarding it here is essential for Slang enable/disable to rebuild the
+	// presentation chain on the next host frame.
+	if (!gpu) {
+		return;
+	}
+	switch (message) {
+	case UIMessage::GPU_CONFIG_CHANGED:
+		GBAStation::NotifyPspGpuConfigChanged();
+		break;
+	case UIMessage::GPU_RENDER_RESIZED:
+		gpu->NotifyRenderResized(g_Config.GetDisplayLayoutConfig(g_display.GetDeviceOrientation()));
+		break;
+	case UIMessage::GPU_DISPLAY_RESIZED:
+		gpu->NotifyDisplayResized();
+		break;
+	default:
+		break;
+	}
 }
 
 void System_RunOnMainThread(std::function<void()> func) {

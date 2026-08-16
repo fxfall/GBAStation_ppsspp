@@ -590,6 +590,28 @@ void Overlay::ReleaseMaskTexture() {
 	}
 }
 
+std::vector<const ShaderInfo *> BuiltinPostShaderOptions() {
+	std::vector<const ShaderInfo *> options;
+	for (const ShaderInfo &info : GetAllPostShaderInfo()) {
+		// Slang presets remain supported by the renderer, but this menu exposes
+		// only PPSSPP's shipped post-processing filters.
+		// Visibility only controls PPSSPP's original multi-pass menu.  It is
+		// not a capability flag, and filtering on it can leave this selector
+		// empty when the registry was built before the UI opened.
+		if (!info.isSlang && info.section != "Off")
+			options.push_back(&info);
+	}
+	return options;
+}
+
+std::string BuiltinPostShaderLabel(const std::string &section) {
+	for (const ShaderInfo *info : BuiltinPostShaderOptions()) {
+		if (info->section == section)
+			return info->name;
+	}
+	return std::string(tr("默认"));
+}
+
 bool Overlay::ConsumeSyncDisplaySettingsRequest() {
 	const bool requested = syncDisplaySettingsRequested_;
 	syncDisplaySettingsRequested_ = false;
@@ -838,6 +860,12 @@ void Overlay::SetGameMaskSettings(bool enabled, const std::string &path) {
 	LoadMaskTexture(draw_);
 }
 
+void Overlay::SetGameShaderSettings(bool enabled, const std::string &section) {
+	gameShaderEnabled_ = enabled;
+	if (!section.empty())
+		gameShaderSection_ = section;
+}
+
 OverlayCommand Overlay::ConsumeCommand() {
 	if (pendingCommand_.action == OverlayAction::None && cheatsLoading_ && !cheatsLoadCommandSent_) {
 		if (cheatsLoadingDelayFrames_ > 0) {
@@ -1015,13 +1043,35 @@ void Overlay::OpenSettingsSidebar(SettingsSidebar sidebar) {
 		pickerDirectory_ = gameMaskPath_.empty() ? Path(kPpssppDataRoot).ToString() : Path(gameMaskPath_).GetDirectory();
 		ReloadPickerEntries();
 	} else if (sidebar == SettingsSidebar::ShaderPicker) {
-		pickerDirectory_ = GetSysDirectory(DIRECTORY_CUSTOM_SHADERS).ToString();
+		pickerDirectory_ = tr("内置滤镜");
 		ReloadPickerEntries();
+	} else if (sidebar == SettingsSidebar::Shader) {
+		// Built-in post shaders are registered lazily in this standalone host.
+		// The old file picker did this incidentally; the LR selector must do it
+		// explicitly before building its option list.
+		ReloadAllPostShaderInfo(draw_);
+		LogMessage(log_, "GBAStation built-in post shader list=%u", (unsigned)BuiltinPostShaderOptions().size());
+		for (const std::string &name : g_Config.vPostShaderNames) {
+			const ShaderInfo *info = GetPostShaderInfo(name);
+			if (info && !info->isSlang && info->section != "Off") {
+				gameShaderSection_ = info->section;
+				gameShaderEnabled_ = true;
+				break;
+			}
+		}
 	}
 }
 
 void Overlay::ReloadPickerEntries() {
 	pickerEntries_.clear();
+	if (settingsSidebar_ == SettingsSidebar::ShaderPicker) {
+		for (const ShaderInfo *shader : BuiltinPostShaderOptions())
+			pickerEntries_.push_back({shader->name, shader->section, false});
+		std::sort(pickerEntries_.begin(), pickerEntries_.end(), [](const PickerEntry &a, const PickerEntry &b) {
+			return a.label < b.label;
+		});
+		return;
+	}
 	if (pickerDirectory_.empty()) return;
 	const Path directory(pickerDirectory_);
 	if (directory.CanNavigateUp()) {
@@ -1097,8 +1147,30 @@ bool Overlay::HandleSettingsSidebarInput(u64 buttons, u64 pressed, bool navUp, b
 				gameMaskEnabled_ = !gameMaskEnabled_;
 				gameDisplaySettingsSaveRequested_ = true;
 			} else {
-				g_Config.vPostShaderNames.clear();
+				if (gameShaderEnabled_) {
+					for (const std::string &name : g_Config.vPostShaderNames) {
+						const ShaderInfo *info = GetPostShaderInfo(name);
+						if (info && !info->isSlang && info->section != "Off") {
+							gameShaderSection_ = info->section;
+							break;
+						}
+					}
+					g_Config.vPostShaderNames.clear();
+					gameShaderEnabled_ = false;
+				} else {
+					gameShaderEnabled_ = true;
+					if (!gameShaderSection_.empty()) {
+						const ShaderInfo *info = GetPostShaderInfo(gameShaderSection_);
+						if (info && !info->isSlang && info->section != "Off") {
+							g_Config.vPostShaderNames.assign(1, info->section);
+							FixPostShaderOrder(&g_Config.vPostShaderNames);
+						}
+					}
+				}
 				gameShaderSettingsSaveRequested_ = true;
+				LogMessage(log_, "GBAStation built-in post shader toggle enabled=%d section=%s chain=%u",
+					gameShaderEnabled_ ? 1 : 0, gameShaderSection_.empty() ? "<none>" : gameShaderSection_.c_str(),
+					(unsigned)g_Config.vPostShaderNames.size());
 				System_PostUIMessage(UIMessage::GPU_CONFIG_CHANGED);
 			}
 		} else if (sidebarSelection_ == 1) {
@@ -1117,18 +1189,16 @@ bool Overlay::HandleSettingsSidebarInput(u64 buttons, u64 pressed, bool navUp, b
 			gameDisplaySettingsSaveRequested_ = true;
 			OpenSettingsSidebar(SettingsSidebar::Mask);
 		} else {
-			ReloadAllPostShaderInfo(draw_);
-			std::string section = Path(entry.path).GetFilename();
-			const size_t dot = section.rfind('.');
-			if (dot != std::string::npos) section.resize(dot);
-			for (const ShaderInfo &shader : GetAllPostShaderInfo()) {
-				if (shader.isSlang && shader.section == section) {
-					g_Config.vPostShaderNames.assign(1, shader.section);
-					FixPostShaderOrder(&g_Config.vPostShaderNames);
-					gameShaderSettingsSaveRequested_ = true;
-					System_PostUIMessage(UIMessage::GPU_CONFIG_CHANGED);
-					break;
-				}
+			const ShaderInfo *shader = GetPostShaderInfo(entry.path);
+			if (shader && !shader->isSlang && shader->section != "Off") {
+				g_Config.vPostShaderNames.assign(1, shader->section);
+				FixPostShaderOrder(&g_Config.vPostShaderNames);
+				gameShaderSection_ = shader->section;
+				gameShaderEnabled_ = true;
+				gameShaderSettingsSaveRequested_ = true;
+				System_PostUIMessage(UIMessage::GPU_CONFIG_CHANGED);
+				LogMessage(log_, "GBAStation built-in post shader selected name=%s section=%s",
+					shader->name.c_str(), shader->section.c_str());
 			}
 			OpenSettingsSidebar(SettingsSidebar::Shader);
 		}
@@ -1932,15 +2002,20 @@ void Overlay::DrawSettingsSidebar(ImDrawList *drawList, ImVec2 displaySize, floa
 		drawList->AddText(font, 20.0f * scale, ImVec2(b.x - valueW - (selector ? 62.0f : 18.0f) * scale, y + 16.0f * scale), IM_COL32(112, 204, 255, 255), value.c_str());
 	};
 	if (picker) {
+		const bool shaderList = settingsSidebar_ == SettingsSidebar::ShaderPicker;
 		const std::string path = pickerDirectory_.empty() ? tr("无可用目录") : pickerDirectory_;
 		drawList->AddText(font, 17.0f * scale, ImVec2(min.x + 30.0f * scale, min.y + 72.0f * scale), IM_COL32(171, 211, 235, 255), path.c_str());
 		const int first = std::clamp(sidebarSelection_ - 4, 0, std::max(0, (int)pickerEntries_.size() - 8));
 		for (int i = 0; i < 8 && first + i < (int)pickerEntries_.size(); ++i) {
 			const PickerEntry &entry = pickerEntries_[first + i];
-			char entryIcon[8];
-			EncodeUtf8(entryIcon, entry.directory ? 0xE2C7 : 0xE24D);
-			row(i, first + i, std::string(entryIcon) + "  " + entry.label,
-				entry.directory ? ">" : "", false);
+			if (shaderList) {
+				row(i, first + i, entry.label, entry.path == gameShaderSection_ ? tr("已选择") : "", false);
+			} else {
+				char entryIcon[8];
+				EncodeUtf8(entryIcon, entry.directory ? 0xE2C7 : 0xE24D);
+				row(i, first + i, std::string(entryIcon) + "  " + entry.label,
+					entry.directory ? ">" : "", false);
+			}
 		}
 	} else if (settingsSidebar_ == SettingsSidebar::Custom) {
 		row(0, 0, tr("缩放倍数"), StringFromFormat("%.2f", displaySettings_.customScale), true);
@@ -1952,8 +2027,8 @@ void Overlay::DrawSettingsSidebar(ImDrawList *drawList, ImVec2 displaySize, floa
 		row(0, 0, tr("遮罩开关"), gameMaskEnabled_ ? tr("开") : tr("关"), false);
 		row(1, 1, tr("遮罩路径选择"), ">", false);
 	} else {
-		row(0, 0, tr("着色器开关"), g_Config.vPostShaderNames.empty() ? tr("关") : tr("开"), false);
-		row(1, 1, tr("着色器路径选择"), ">", false);
+		row(0, 0, tr("着色器开关"), gameShaderEnabled_ ? tr("开") : tr("关"), false);
+		row(1, 1, tr("着色器选择"), BuiltinPostShaderLabel(gameShaderSection_), false);
 	}
 	char b[8], a[8]; EncodeUtf8(b, 0xE0E1); EncodeUtf8(a, 0xE0E0);
 	const std::string footerBack = picker ? tr("返回") : tr("关闭");
@@ -1969,13 +2044,13 @@ void Overlay::DrawSyncConfirmDialog(ImDrawList *drawList, ImVec2 displaySize, fl
 		return;
 	}
 	const std::string kind = syncConfirm_ == SyncConfirm::Display ? tr("画面设置") :
-		syncConfirm_ == SyncConfirm::Mask ? tr("遮罩") : tr("Slang 着色器");
+		syncConfirm_ == SyncConfirm::Mask ? tr("遮罩") : tr("内置滤镜");
 	const std::string title = std::string(tr("同步 ")) + kind;
 	const std::string details = syncConfirm_ == SyncConfirm::Display
 		? tr("渲染分辨率、显示模式、画面比例、整数倍数和自定义设置")
 		: syncConfirm_ == SyncConfirm::Mask
 			? tr("遮罩开关和遮罩路径")
-			: tr("着色器开关、着色器路径和着色器参数");
+			: tr("着色器开关、内置滤镜和滤镜参数");
 	const std::string message = tr("将同步以下设置到所有其他 PSP 游戏：\n") + details + tr("\n不会覆盖当前游戏。");
 	const float boxW = std::min(620.0f * scale, displaySize.x - 56.0f * scale);
 	const float boxH = 236.0f * scale;

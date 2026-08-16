@@ -77,6 +77,9 @@ public:
 	void SetGameMaskSettings(bool enabled, const std::string &path);
 	bool IsGameMaskEnabled() const { return gameMaskEnabled_; }
 	const std::string &GameMaskPath() const { return gameMaskPath_; }
+	void SetGameShaderSettings(bool enabled, const std::string &section);
+	bool IsGameShaderEnabled() const { return gameShaderEnabled_; }
+	const std::string &GameShaderSection() const { return gameShaderSection_; }
 	// These requests are deliberately one-shot.  The runtime owns GameDB and
 	// applies a confirmed request to every *other* PSP entry.
 	bool ConsumeSyncDisplaySettingsRequest();
@@ -228,6 +231,8 @@ private:
 	std::vector<Draw::Texture *> retiredMaskTextures_;
 	bool gameMaskEnabled_ = false;
 	std::string gameMaskPath_;
+	bool gameShaderEnabled_ = false;
+	std::string gameShaderSection_;
 	ImGuiContext *context_ = nullptr;
 };
 

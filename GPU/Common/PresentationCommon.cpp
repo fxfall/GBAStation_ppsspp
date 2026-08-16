@@ -226,6 +226,16 @@ static float GetShaderSettingValue(const ShaderInfo *shaderInfo, int i, const ch
 	return shaderInfo->settings[i].value;
 }
 
+static float GetSlangParameterValue(const ShaderInfo *shaderInfo, int i) {
+	if (!shaderInfo->slangPreset || i < 0 || i >= (int)shaderInfo->slangPreset->parameters.size())
+		return 0.0f;
+	std::string key = shaderInfo->section + StringFromFormat("SettingCurrentValue%d", i + 1);
+	auto it = g_Config.mPostShaderSetting.find(key);
+	if (it != g_Config.mPostShaderSetting.end())
+		return it->second;
+	return shaderInfo->slangPreset->parameters[i].current;
+}
+
 void PresentationCommon::CalculatePostShaderUniforms(int bufferWidth, int bufferHeight, int targetWidth, int targetHeight, const ShaderInfo *shaderInfo, PostShaderUniforms *uniforms) const {
 	float u_delta = 1.0f / bufferWidth;
 	float v_delta = 1.0f / bufferHeight;
@@ -344,6 +354,29 @@ bool PresentationCommon::UpdatePostShader(const DisplayLayoutConfig &config) {
 		if (infoCopy.usePreviousFrame) {
 			usePreviousFrame = true;
 			usePreviousAtOutputResolution = infoCopy.outputResolution;
+		}
+	}
+
+	// A PassFeedback sampler reads the previous frame of a particular pass.
+	// Allocate two targets per such pass and alternate them each presentation.
+	slangFeedbackFramebuffers_.resize(postShaderInfo_.size());
+	slangFeedbackValid_.assign(postShaderInfo_.size(), false);
+	slangFeedbackIndex_ = 0;
+	for (size_t i = 0; i < postShaderInfo_.size(); ++i) {
+		const ShaderInfo &info = postShaderInfo_[i];
+		if (!info.isSlang || !info.slangPreset || info.slangPassIndex < 0 ||
+			info.slangPassIndex >= (int)info.slangPreset->passes.size() ||
+			!info.slangPreset->passes[info.slangPassIndex].feedback)
+			continue;
+
+		int w = 0, h = 0;
+		draw_->GetFramebufferDimensions(postShaderFramebuffers_[i], &w, &h);
+		for (Draw::Framebuffer *&fb : slangFeedbackFramebuffers_[i]) {
+			fb = draw_->CreateFramebuffer({ w, h, 1, 1, 0, false, "slang-feedback" });
+			if (!fb) {
+				DestroyPostShader();
+				return false;
+			}
 		}
 	}
 
@@ -509,6 +542,35 @@ bool PresentationCommon::BuildPostShader(const DisplayLayoutConfig &config, cons
 		return false;
 	}
 
+	if (shaderInfo->isSlang) {
+		// Slang controls the size of every pass independently. Always retain the
+		// final result in a framebuffer: CopyToOutput is a plain blit and cannot
+		// supply Slang's textures and uniform buffer.
+		int sourceWidth = renderWidth_;
+		int sourceHeight = renderHeight_;
+		if (!postShaderFramebuffers_.empty())
+			draw_->GetFramebufferDimensions(postShaderFramebuffers_.back(), &sourceWidth, &sourceHeight);
+
+		FRect viewport;
+		FRect frame = GetScreenFrame(config.bIgnoreScreenInsets, (float)pixelWidth_, (float)pixelHeight_);
+		CalculateDisplayOutputRect(config, &viewport, 480.0f, 272.0f, frame, config.iInternalScreenRotation);
+		const SlangPass &pass = shaderInfo->slangPreset->passes[shaderInfo->slangPassIndex];
+		auto resolveDimension = [](SlangScaleType type, float scale, int source, float viewportSize) {
+			float base = type == SlangScaleType::ABSOLUTE ? 1.0f : type == SlangScaleType::VIEWPORT ? viewportSize : (float)source;
+			return std::max(1, (int)std::lround(base * std::max(0.0f, scale)));
+		};
+		int w = resolveDimension(pass.scaleX, pass.scaleXValue, sourceWidth, viewport.w);
+		int h = resolveDimension(pass.scaleY, pass.scaleYValue, sourceHeight, viewport.h);
+		// PassOutput aliases may be read several passes later, so Slang targets
+		// must never be recycled while constructing this chain.
+		if (!AllocateFramebuffer(w, h, false)) {
+			(*outPipeline)->Release();
+			*outPipeline = nullptr;
+			return false;
+		}
+		return true;
+	}
+
 	if (!shaderInfo->outputResolution || next) {
 		int nextWidth = renderWidth_;
 		int nextHeight = renderHeight_;
@@ -545,17 +607,19 @@ bool PresentationCommon::BuildPostShader(const DisplayLayoutConfig &config, cons
 	return true;
 }
 
-bool PresentationCommon::AllocateFramebuffer(int w, int h) {
+bool PresentationCommon::AllocateFramebuffer(int w, int h, bool allowReuse) {
 	using namespace Draw;
 
 	// First, let's try to find a framebuffer of the right size that is NOT the most recent.
 	Framebuffer *last = postShaderFramebuffers_.empty() ? nullptr : postShaderFramebuffers_.back();
-	for (const auto &prev : postShaderFBOUsage_) {
-		if (prev.w == w && prev.h == h && prev.fbo != last) {
-			// Great, this one's perfect.  Ref it for when we release.
-			prev.fbo->AddRef();
-			postShaderFramebuffers_.push_back(prev.fbo);
-			return true;
+	if (allowReuse) {
+		for (const auto &prev : postShaderFBOUsage_) {
+			if (prev.w == w && prev.h == h && prev.fbo != last) {
+				// Great, this one's perfect.  Ref it for when we release.
+				prev.fbo->AddRef();
+				postShaderFramebuffers_.push_back(prev.fbo);
+				return true;
+			}
 		}
 	}
 
@@ -658,6 +722,18 @@ void PresentationCommon::CreateDeviceObjects() {
 
 	samplerNearest_ = draw_->CreateSamplerState({ TextureFilter::NEAREST, TextureFilter::NEAREST, TextureFilter::NEAREST, 0.0f, TextureAddressMode::CLAMP_TO_EDGE, TextureAddressMode::CLAMP_TO_EDGE, TextureAddressMode::CLAMP_TO_EDGE });
 	samplerLinear_ = draw_->CreateSamplerState({ TextureFilter::LINEAR, TextureFilter::LINEAR, TextureFilter::LINEAR, 0.0f, TextureAddressMode::CLAMP_TO_EDGE, TextureAddressMode::CLAMP_TO_EDGE, TextureAddressMode::CLAMP_TO_EDGE });
+	const TextureAddressMode slangAddressModes[] = {
+		TextureAddressMode::CLAMP_TO_BORDER,
+		TextureAddressMode::REPEAT,
+		TextureAddressMode::REPEAT_MIRROR,
+		TextureAddressMode::CLAMP_TO_EDGE,
+	};
+	for (size_t wrap = 0; wrap < slangSamplers_.size(); ++wrap) {
+		for (size_t filter = 0; filter < slangSamplers_[wrap].size(); ++filter) {
+			TextureFilter value = filter == 0 ? TextureFilter::LINEAR : TextureFilter::NEAREST;
+			slangSamplers_[wrap][filter] = draw_->CreateSamplerState({ value, value, value, 0.0f, slangAddressModes[wrap], slangAddressModes[wrap], slangAddressModes[wrap] });
+		}
+	}
 
 	texColor_ = CreatePipeline({ draw_->GetVshaderPreset(VS_TEXTURE_COLOR_2D), draw_->GetFshaderPreset(FS_TEXTURE_COLOR_2D) }, false, &vsTexColBufDesc);
 	texColorRBSwizzle_ = CreatePipeline({ draw_->GetVshaderPreset(VS_TEXTURE_COLOR_2D), draw_->GetFshaderPreset(FS_TEXTURE_COLOR_2D_RB_SWIZZLE) }, false, &vsTexColBufDesc);
@@ -684,6 +760,9 @@ void PresentationCommon::DestroyDeviceObjects() {
 	DoRelease(texColorRBSwizzle_);
 	DoRelease(samplerNearest_);
 	DoRelease(samplerLinear_);
+	for (auto &byWrap : slangSamplers_)
+		for (Draw::SamplerState *&sampler : byWrap)
+			DoRelease(sampler);
 	DoRelease(vdata_);
 	DoRelease(srcTexture_);
 	DoRelease(srcFramebuffer_);
@@ -699,6 +778,13 @@ void PresentationCommon::DestroyPostShader() {
 	DoReleaseVector(postShaderPipelines_);
 	DoReleaseVector(postShaderFramebuffers_);
 	DoReleaseVector(previousFramebuffers_);
+	for (auto &pair : slangFeedbackFramebuffers_) {
+		DoRelease(pair[0]);
+		DoRelease(pair[1]);
+	}
+	slangFeedbackFramebuffers_.clear();
+	slangFeedbackValid_.clear();
+	slangFeedbackIndex_ = 0;
 	for (auto &[id, tex] : lutTextures_)
 		DoRelease(tex);
 	lutTextures_.clear();
@@ -713,7 +799,8 @@ Draw::Texture *PresentationCommon::GetLutTexture(const std::shared_ptr<SlangPres
 		return nullptr;
 	const SlangLut &lut = preset->luts[index];
 
-	auto itr = lutTextures_.find(lut.id);
+	const std::string cacheKey = lut.path + "::" + lut.id;
+	auto itr = lutTextures_.find(cacheKey);
 	if (itr != lutTextures_.end())
 		return itr->second;
 
@@ -721,7 +808,7 @@ Draw::Texture *PresentationCommon::GetLutTexture(const std::shared_ptr<SlangPres
 	unsigned char *data = nullptr;
 	if (!pngLoad(lut.path.c_str(), &w, &h, &data) || !data) {
 		WARN_LOG(Log::FrameBuf, "Failed to load slang LUT texture '%s'", lut.path.c_str());
-		lutTextures_[lut.id] = nullptr;
+		lutTextures_[cacheKey] = nullptr;
 		return nullptr;
 	}
 
@@ -739,7 +826,7 @@ Draw::Texture *PresentationCommon::GetLutTexture(const std::shared_ptr<SlangPres
 	free(data);
 	if (!tex)
 		WARN_LOG(Log::FrameBuf, "Failed to create slang LUT texture '%s'", lut.path.c_str());
-	lutTextures_[lut.id] = tex;
+	lutTextures_[cacheKey] = tex;
 	return tex;
 }
 
@@ -951,10 +1038,15 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 
 	// Grab the previous framebuffer early so we can change previousIndex_ when we want.
 	Draw::Framebuffer *previousFramebuffer = previousFramebuffers_.empty() ? nullptr : previousFramebuffers_[previousIndex_];
+	// Keep the exact output of every Slang pass. PassOutput# refers to a preset
+	// pass number, not the global post-shader chain index, and therefore cannot
+	// safely be resolved by indexing postShaderFramebuffers_ directly.
+	std::vector<Draw::Framebuffer *> slangPassOutputs(postShaderInfo_.size(), nullptr);
+	bool usedSlangFeedback = false;
 
 	// Renders one slang pass: binds textures according to the reflected semantics,
 	// fills the reflected UBO and draws.
-	const auto performSlangPass = [&](const ShaderInfo *shaderInfo, Draw::Framebuffer *postShaderFramebuffer, Draw::Pipeline *postShaderPipeline, int vertsOffset) {
+	const auto performSlangPass = [&](const ShaderInfo *shaderInfo, size_t chainIndex, Draw::Framebuffer *postShaderFramebuffer, Draw::Pipeline *postShaderPipeline, int vertsOffset) {
 		_dbg_assert_(shaderInfo->slangCompiled);
 		const pass_semantics_t &semantics = shaderInfo->slangCompiled->semantics;
 
@@ -975,6 +1067,17 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 		lastSlangTime_ = now;
 		ctx.fps = 60.0f;
 		ctx.aspect = 480.0f / 272.0f;
+
+		auto findPresetPass = [&](unsigned presetPass, bool includeCurrent) -> size_t {
+			const size_t last = includeCurrent ? chainIndex : (chainIndex == 0 ? 0 : chainIndex - 1);
+			for (size_t i = 0; i <= last && i < postShaderInfo_.size(); ++i) {
+				const ShaderInfo &candidate = postShaderInfo_[i];
+				if (candidate.isSlang && candidate.section == shaderInfo->section &&
+					candidate.slangPassIndex == (int)presetPass)
+					return i;
+			}
+			return postShaderInfo_.size();
+		};
 
 		for (int t = 0; t < semantics.texture_count; t++) {
 			const texture_sem_t &tex = semantics.textures[t];
@@ -1013,8 +1116,12 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 				h = srcHeight_;
 				break;
 			case SLANG_TEXTURE_SEMANTIC_PASS_OUTPUT:
-				if (tex.index < postShaderFramebuffers_.size()) {
-					fbObj = postShaderFramebuffers_[tex.index];
+				{
+					size_t passIndex = findPresetPass(tex.index, false);
+					if (passIndex < slangPassOutputs.size())
+						fbObj = slangPassOutputs[passIndex];
+				}
+				if (fbObj) {
 					draw_->GetFramebufferDimensions(fbObj, &w, &h);
 				}
 				break;
@@ -1032,8 +1139,27 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 				}
 				break;
 			case SLANG_TEXTURE_SEMANTIC_PASS_FEEDBACK:
-				// Not supported yet (requires per-pass frame history).
-				WARN_LOG(Log::FrameBuf, "Slang PassFeedback texture not supported yet.");
+				{
+					size_t passIndex = findPresetPass(tex.index, true);
+					if (passIndex < slangFeedbackFramebuffers_.size() && slangFeedbackValid_[passIndex])
+						fbObj = slangFeedbackFramebuffers_[passIndex][slangFeedbackIndex_ ^ 1];
+					// The first frame has no history. Falling back to the current
+					// chain input gives deterministic output instead of sampling an
+					// undefined framebuffer.
+					if (!fbObj && postShaderOutput_) {
+						fbObj = postShaderOutput_;
+					} else if (!fbObj && srcFramebuffer_) {
+						fbObj = srcFramebuffer_;
+					} else if (!fbObj && srcTexture_) {
+						texObj = srcTexture_;
+					}
+				}
+				if (fbObj)
+					draw_->GetFramebufferDimensions(fbObj, &w, &h);
+				else if (texObj) {
+					w = srcWidth_;
+					h = srcHeight_;
+				}
 				break;
 			default:
 				break;
@@ -1046,7 +1172,10 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 			else
 				WARN_LOG(Log::FrameBuf, "Slang texture %s (%d#%d) has no source.", tex.id, (int)tex.semantic, tex.index);
 
-			Draw::SamplerState *sampler = tex.filter == 0 ? samplerLinear_ : samplerNearest_;
+			int wrap = (int)tex.wrap;
+			if (wrap < 0 || wrap >= (int)slangSamplers_.size())
+				wrap = (int)SlangWrapType::EDGE;
+			Draw::SamplerState *sampler = slangSamplers_[wrap][tex.filter == 0 ? 0 : 1];
 			draw_->BindSamplerStates(slot, 1, &sampler);
 
 			if (tex.semantic >= 0 && tex.semantic < SLANG_NUM_TEXTURE_SEMANTICS && tex.index < 8) {
@@ -1062,7 +1191,7 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 		if (shaderInfo->slangPreset) {
 			paramValues.resize(shaderInfo->slangPreset->parameters.size());
 			for (size_t i = 0; i < paramValues.size(); ++i) {
-				paramValues[i] = GetShaderSettingValue(shaderInfo, (int)i, StringFromFormat("SettingCurrentValue%d", (int)i + 1).c_str());
+				paramValues[i] = GetSlangParameterValue(shaderInfo, (int)i);
 			}
 			ctx.paramValues = paramValues.data();
 			ctx.numParams = (int)paramValues.size();
@@ -1078,13 +1207,16 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 		draw_->Draw(4, 0);
 
 		postShaderOutput_ = postShaderFramebuffer;
+		slangPassOutputs[chainIndex] = postShaderFramebuffer;
+		if (chainIndex < slangFeedbackFramebuffers_.size() && slangFeedbackFramebuffers_[chainIndex][0])
+			slangFeedbackValid_[chainIndex] = true;
 		lastWidth = pw;
 		lastHeight = ph;
 	};
 
-	const auto performShaderPass = [&](const ShaderInfo *shaderInfo, Draw::Framebuffer *postShaderFramebuffer, Draw::Pipeline *postShaderPipeline, int vertsOffset) {
+	const auto performShaderPass = [&](const ShaderInfo *shaderInfo, size_t chainIndex, Draw::Framebuffer *postShaderFramebuffer, Draw::Pipeline *postShaderPipeline, int vertsOffset) {
 		if (shaderInfo->isSlang) {
-			performSlangPass(shaderInfo, postShaderFramebuffer, postShaderPipeline, vertsOffset);
+			performSlangPass(shaderInfo, chainIndex, postShaderFramebuffer, postShaderPipeline, vertsOffset);
 			return;
 		}
 		if (postShaderOutput_) {
@@ -1146,7 +1278,10 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 			Draw::Pipeline *postShaderPipeline = postShaderPipelines_[i];
 			const ShaderInfo *shaderInfo = &postShaderInfo_[i];
 			Draw::Framebuffer *postShaderFramebuffer = postShaderFramebuffers_[i];
-			if (!isFinalAtOutputResolution && i == postShaderFramebuffers_.size() - 1 && !previousFramebuffers_.empty()) {
+			if (shaderInfo->isSlang && i < slangFeedbackFramebuffers_.size() && slangFeedbackFramebuffers_[i][0]) {
+				postShaderFramebuffer = slangFeedbackFramebuffers_[i][slangFeedbackIndex_];
+				usedSlangFeedback = true;
+			} else if (!isFinalAtOutputResolution && i == postShaderFramebuffers_.size() - 1 && !previousFramebuffers_.empty()) {
 				// This is the last pass and we're going direct to the backbuffer after this.
 				// Redirect output to a separate framebuffer to keep the previous frame.
 				previousIndex_++;
@@ -1159,8 +1294,10 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 
 			// Pick vertices 8-11 for the first pass.
 			int vertOffset = i == 0 ? (int)sizeof(Vertex) * 8 : (int)sizeof(Vertex) * 4;
-			performShaderPass(shaderInfo, postShaderFramebuffer, postShaderPipeline, vertOffset);
+			performShaderPass(shaderInfo, i, postShaderFramebuffer, postShaderPipeline, vertOffset);
 		}
+		if (usedSlangFeedback)
+			slangFeedbackIndex_ ^= 1;
 
 		if (isFinalAtOutputResolution && postShaderInfo_.back().isUpscalingFilter)
 			useNearest = true;
@@ -1181,7 +1318,7 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 		Draw::Framebuffer *postShaderFramebuffer = previousFramebuffers_[previousIndex_];
 
 		draw_->BindFramebufferAsRenderTarget(postShaderFramebuffer, {Draw::RPAction::CLEAR, Draw::RPAction::DONT_CARE, Draw::RPAction::DONT_CARE}, "InterFrameBlit");
-		performShaderPass(shaderInfo, postShaderFramebuffer, postShaderPipeline, postVertsOffset);
+		performShaderPass(shaderInfo, postShaderInfo_.size() - 1, postShaderFramebuffer, postShaderPipeline, postVertsOffset);
 	}
 }
 

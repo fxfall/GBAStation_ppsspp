@@ -11,6 +11,7 @@ namespace GBAStation {
 // a preset/parameter change is persisted per game instead of leaking into the
 // user's global PPSSPP configuration.
 void PersistPspGameDbShaderSettings();
+void NotifyPspGpuConfigChanged();
 
 class PpssppRuntime final : public CoreRuntime {
 public:

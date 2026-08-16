@@ -252,6 +252,24 @@ bool SlangPreprocessParseParameters(const std::string &shaderPath, SlangPreset *
 		});
 
 		if (itr != preset->parameters.end()) {
+			// The .slangp parameter list is intentionally read before its shader
+			// sources so a malformed optional pass cannot hide the whole preset
+			// from the picker. Replace that lightweight entry with the authoritative
+			// pragma metadata when this pass is compiled.
+			const bool presetPlaceholder = std::string(itr->desc) == itr->id &&
+				itr->initial == 0.0f && itr->minimum == 0.0f && itr->maximum == 1.0f && itr->step == 0.01f;
+			if (presetPlaceholder) {
+				const float presetValue = itr->current;
+				const bool hasPresetValue = itr->hasPresetValue;
+				strncpy(itr->desc, p.desc.c_str(), sizeof(itr->desc) - 1);
+				itr->initial = p.initial;
+				itr->minimum = p.minimum;
+				itr->maximum = p.maximum;
+				itr->step = p.step;
+				itr->current = hasPresetValue ? presetValue : p.initial;
+				itr->hasPresetValue = hasPresetValue;
+				continue;
+			}
 			// Allow duplicate #pragma parameter, but only if they are exactly the same.
 			if (p.desc != itr->desc || p.initial != itr->initial || p.minimum != itr->minimum || p.maximum != itr->maximum || p.step != itr->step) {
 				ERROR_LOG(Log::G3D, "[Slang] Duplicate parameters found for \"%s\", but arguments do not match.\n", p.id.c_str());

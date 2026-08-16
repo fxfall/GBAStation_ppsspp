@@ -127,6 +127,10 @@ struct TextureShaderInfo {
 };
 
 void ReloadAllPostShaderInfo(Draw::DrawContext *draw);
+// Registers an absolute .slangp chosen by the GBAStation picker. The path is
+// retained across ReloadAllPostShaderInfo() calls, avoiding platform-specific
+// custom-directory enumeration failures.
+bool RegisterSlangPresetPath(const std::string &path, std::string *error = nullptr);
 
 const ShaderInfo *GetPostShaderInfo(std::string_view name);
 std::vector<const ShaderInfo *> GetPostShaderChain(const std::string &name);

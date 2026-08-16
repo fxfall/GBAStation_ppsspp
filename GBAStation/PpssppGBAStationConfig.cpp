@@ -390,6 +390,8 @@ void ApplySwitchRequiredConfig(bool audioReady) {
 	g_Config.sReportHost.clear();
 	g_Config.internalDataDirectory = Path(kPpssppDataRoot);
 	g_Config.memStickDirectory = Path(kPpssppDataRoot);
+	// Keep PSP savedata in GBAStation's established save root so existing
+	// installations retain access to their game saves after upgrading.
 	g_Config.memStickSavedataDirectory = Path(kPpssppSaveDataRoot);
 	g_Config.saveStateDirectory = Path(Paths::PpssppSaveStates);
 	g_Config.iSaveStateSlotCount = Ppsspp::SaveStateSlotCount;

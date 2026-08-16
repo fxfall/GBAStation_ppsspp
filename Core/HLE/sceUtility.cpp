@@ -415,6 +415,17 @@ void __UtilityShutdown() {
 	delete npSigninDialog;
 }
 
+bool UtilitySavedataIsActive() {
+	// sceUtilitySavedataShutdownStart() clears currentDialogActive before its
+	// helper thread has completed the guest-side shutdown handshake.  A
+	// frontend that tears the core down in that gap can interrupt a completed
+	// looking, but not yet durable, PSP save.
+	const bool dialogActive = currentDialogActive && currentDialogType == UtilityDialogType::SAVEDATA;
+	const bool shutdownThreadActive = currentDialogType == UtilityDialogType::SAVEDATA &&
+		accessThread != nullptr && !accessThreadFinished;
+	return dialogActive || shutdownThreadActive;
+}
+
 void UtilityDialogInitialize(UtilityDialogType type, int delayUs, int priority) {
 	int partDelay = delayUs / 4;
 	const u32_le insts[] = {

@@ -123,6 +123,11 @@ void __UtilityInit();
 void __UtilityDoState(PointerWrap &p);
 void __UtilityShutdown();
 
+// The frontend can safely defer a destructive core restart while the PSP
+// savedata utility is still active.  Its actual file I/O runs on a worker
+// thread, so tearing the core down at this point can interrupt a save.
+bool UtilitySavedataIsActive();
+
 void UtilityDialogInitialize(UtilityDialogType type, int delayUs, int priority);
 void UtilityDialogShutdown(UtilityDialogType type, int delayUs, int priority);
 

@@ -110,6 +110,9 @@ public:
 	}
 	bool ShouldExitGame() const { return exitRequested_; }
 	void ClearExitRequest() { exitRequested_ = false; }
+	// The runtime keeps the menu alive while the configured exit savestate and
+	// its thumbnail are written.  This state deliberately consumes all input.
+	void SetExitSaving(bool saving, bool waitingForNativeSave = false);
 	OverlayCommand ConsumeCommand();
 	void SetVisible(bool visible);
 
@@ -149,6 +152,7 @@ private:
 	void DrawHelpers(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
 	void DrawRAAlerts(Draw::DrawContext *draw, ::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float deltaTime);
 	void DrawSyncConfirmDialog(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
+	void DrawExitSavingDialog(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
 	void DrawSettingsSidebar(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
 	void CycleSetting(int direction);
 	void OpenSettingsSidebar(SettingsSidebar sidebar);
@@ -170,6 +174,8 @@ private:
 	bool visible_ = false;
 	bool comboDown_ = false;
 	bool exitRequested_ = false;
+	bool exitSaving_ = false;
+	bool exitWaitingForNativeSave_ = false;
 	int selection_ = 0;
 	int tabSelection_ = 0;
 	bool sidebarFocused_ = true;
@@ -212,10 +218,15 @@ private:
 	u64 lastAnalogNavMs_ = 0;
 	u64 lastDPadNavMs_ = 0;
 	// 3DS-style d-pad repeat: first repeat waits 280 ms, then speeds up.
-	static constexpr u64 kDPadNavInitialRepeatMs = 280;
+	static constexpr u64 kDPadNavInitialRepeatMs = 360;
 	int dpadNavDir_ = 0;
 	u64 nextDPadNavMs_ = 0;
 	u64 dpadNavStartMs_ = 0;
+	// LR selectors use their own repeat track so settings can be adjusted
+	// smoothly without accelerating general menu navigation.
+	int selectorAdjustDir_ = 0;
+	u64 selectorAdjustStartMs_ = 0;
+	u64 selectorAdjustNextMs_ = 0;
 	u64 nextCheatVerticalNavMs_ = 0;
 	u64 nextCheatHorizontalNavMs_ = 0;
 	int cheatVerticalNavDir_ = 0;

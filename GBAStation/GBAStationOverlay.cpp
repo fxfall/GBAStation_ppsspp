@@ -49,7 +49,6 @@ struct QuickMenuItem {
 		Cheats,
 		VideoSettings,
 		CoreSettings,
-		Reset,
 		ExitGame,
 	} action;
 };
@@ -61,7 +60,6 @@ constexpr QuickMenuItem kQuickMenuItems[] = {
 	{"emulator_cheats", QuickMenuItem::Action::Cheats},
 	{"emulator_video_settings", QuickMenuItem::Action::VideoSettings},
 	{"emulator_core_settings", QuickMenuItem::Action::CoreSettings},
-	{"emulator_reset", QuickMenuItem::Action::Reset},
 	{"emulator_exit_game", QuickMenuItem::Action::ExitGame},
 };
 
@@ -612,6 +610,60 @@ std::string BuiltinPostShaderLabel(const std::string &section) {
 	return std::string(tr("默认"));
 }
 
+struct CoreExtraOption {
+	const char *label;
+	const char *key;
+	const char *values;
+};
+
+// All values are launcher config.cfg values (core.ppsspp.<key>).  They are
+// deliberately separate from the settings already exposed above this list.
+constexpr CoreExtraOption kCoreExtraOptions[] = {
+	{"CPU 后端", "ppsspp_cpu_core", "JIT|IR JIT|Interpreter"},
+	{"忽略错误内存访问", "ppsspp_ignore_bad_memory_access", "enabled|disabled"},
+	{"I/O 时序", "ppsspp_io_timing_method", "Fast|Host|Simulate UMD delays|Simulate UMD slow reading speed"},
+	{"强制延迟同步", "ppsspp_force_lag_sync", "disabled|enabled"},
+	{"锁定 CPU 时钟", "ppsspp_locked_cpu_speed", "0|20|50|100|200|222|266|333"},
+	{"缓存 ISO", "ppsspp_cache_iso", "disabled|enabled"},
+	{"启用金手指", "ppsspp_cheats", "disabled|enabled"},
+	{"PSP 机型", "ppsspp_psp_model", "psp_1000|psp_2000_3000"},
+	{"确认键偏好", "ppsspp_button_preference", "Cross|Circle"},
+	{"软件渲染", "ppsspp_software_rendering", "disabled|enabled"},
+	{"降低特效分辨率", "ppsspp_lower_resolution_for_effects", "Off|Safe|Balanced|Aggressive"},
+	{"多重采样", "ppsspp_multisample_level", "Disabled|x2|x4|x8"},
+	{"在途帧数", "ppsspp_inflight_frames", "No buffer|Up to 1|Up to 2"},
+	{"纹理缩放算法", "ppsspp_texture_scaling_type", "xbrz|hybrid|bicubic|hybrid_bicubic"},
+	{"纹理缩放倍率", "ppsspp_texture_scaling_level", "disabled|2x|3x|4x|5x"},
+	{"纹理替换", "ppsspp_texture_replacement", "enabled|disabled"},
+	{"纹理缩放着色器", "ppsspp_texture_shader", "disabled|2xBRZ|4xBRZ|MMPX"},
+	{"智能 2D 纹理过滤", "ppsspp_smart_2d_texture_filtering", "disabled|enabled"},
+	{"延迟纹理缓存", "ppsspp_lazy_texture_caching", "disabled|enabled"},
+	{"圆形模拟摇杆", "ppsspp_analog_is_circular", "disabled|enabled"},
+	{"摇杆死区", "ppsspp_analog_deadzone", "0.00|0.10|0.15|0.20|0.25|0.30"},
+	{"摇杆灵敏度", "ppsspp_analog_sensitivity", "0.80|0.90|1.00|1.10|1.20|1.30"},
+	{"PSP 系统语言", "ppsspp_language", "Automatic|English|Japanese|French|Spanish|German|Italian|Korean|Chinese Traditional|Chinese Simplified"},
+	{"插入记忆棒", "ppsspp_memstick_inserted", "enabled|disabled"},
+	{"裁切至 16:9", "ppsspp_cropto16x9", "disabled|enabled"},
+	{"软件蒙皮", "ppsspp_software_skinning", "disabled|enabled"},
+	{"硬件曲面细分", "ppsspp_hardware_tesselation", "disabled|enabled"},
+	{"跳过 GPU 读取", "ppsspp_skip_gpu_readbacks", "disabled|enabled"},
+	{"曲线质量", "ppsspp_spline_quality", "Low|Medium|High"},
+	{"禁用范围剔除", "ppsspp_disable_range_culling", "disabled|enabled"},
+};
+
+std::vector<std::string> CoreExtraValues(const CoreExtraOption &option) {
+	std::vector<std::string> values;
+	SplitString(option.values, '|', values);
+	return values;
+}
+
+bool CoreExtraRequiresRestart(const char *key) {
+	return !std::strcmp(key, "ppsspp_cpu_core") || !std::strcmp(key, "ppsspp_io_timing_method") ||
+		!std::strcmp(key, "ppsspp_cache_iso") || !std::strcmp(key, "ppsspp_psp_model") ||
+		!std::strcmp(key, "ppsspp_software_rendering") || !std::strcmp(key, "ppsspp_multisample_level") ||
+		!std::strcmp(key, "ppsspp_inflight_frames") || !std::strcmp(key, "ppsspp_language");
+}
+
 bool Overlay::ConsumeSyncDisplaySettingsRequest() {
 	const bool requested = syncDisplaySettingsRequested_;
 	syncDisplaySettingsRequested_ = false;
@@ -710,6 +762,8 @@ void Overlay::Shutdown() {
 	visible_ = false;
 	comboDown_ = false;
 	exitRequested_ = false;
+	exitSaving_ = false;
+	exitWaitingForNativeSave_ = false;
 	menu_ = Menu::Quick;
 	selection_ = 0;
 	tabSelection_ = 0;
@@ -733,6 +787,9 @@ void Overlay::Shutdown() {
 	pickerEntries_.clear();
 	pickerDirectory_.clear();
 	lastAnalogNavMs_ = 0;
+	selectorAdjustDir_ = 0;
+	selectorAdjustStartMs_ = 0;
+	selectorAdjustNextMs_ = 0;
 	nextCheatVerticalNavMs_ = 0;
 	nextCheatHorizontalNavMs_ = 0;
 	cheatVerticalNavDir_ = 0;
@@ -755,6 +812,9 @@ void Overlay::SetVisible(bool visible) {
 	sidebarSelection_ = 0;
 	animTimer_ = 0.0f;
 	lastAnalogNavMs_ = 0;
+	selectorAdjustDir_ = 0;
+	selectorAdjustStartMs_ = 0;
+	selectorAdjustNextMs_ = 0;
 	nextCheatVerticalNavMs_ = 0;
 	nextCheatHorizontalNavMs_ = 0;
 	cheatVerticalNavDir_ = 0;
@@ -769,6 +829,14 @@ void Overlay::SetVisible(bool visible) {
 		cheatsLoadingDelayFrames_ = 0;
 	}
 	LogMessage(log_, "GBAStation overlay visible=%d", visible ? 1 : 0);
+}
+
+void Overlay::SetExitSaving(bool saving, bool waitingForNativeSave) {
+	exitSaving_ = saving;
+	exitWaitingForNativeSave_ = saving && waitingForNativeSave;
+	if (saving && !visible_) {
+		SetVisible(true);
+	}
 }
 
 void Overlay::SetSaveStateInfo(int currentSlot, const std::array<bool, Ppsspp::SaveStateSlotCount> &slotInUse,
@@ -886,7 +954,7 @@ int Overlay::QuickMenuStorageIndex(int visibleIndex) const {
 }
 
 void Overlay::ActivateTab(int tab) {
-	tabSelection_ = std::clamp(tab, 0, 7);
+	tabSelection_ = std::clamp(tab, 0, 6);
 	selection_ = 0;
 	settingsSelection_ = 0;
 	sidebarFocused_ = true;
@@ -935,7 +1003,7 @@ int Overlay::ItemCount() const {
 	if (menu_ == Menu::Cheats) {
 		return std::max(1, (int)cheats_.size());
 	}
-	return coreSettingsPage_ ? 9 : 13;
+	return coreSettingsPage_ ? 9 + (int)ARRAY_SIZE(kCoreExtraOptions) : 13;
 }
 
 void Overlay::ApplyDisplaySettings(bool save) {
@@ -952,13 +1020,25 @@ void Overlay::CycleSetting(int direction) {
 	}
 
 	if (coreSettingsPage_) {
+		if (settingsSelection_ >= 9) {
+			const CoreExtraOption &option = kCoreExtraOptions[settingsSelection_ - 9];
+			const std::vector<std::string> values = CoreExtraValues(option);
+			const std::string current = GetPspCoreConfigValue(option.key, values.front().c_str());
+			int index = 0;
+			for (int i = 0; i < (int)values.size(); ++i) {
+				if (values[i] == current) { index = i; break; }
+			}
+			index = (index + direction + (int)values.size()) % (int)values.size();
+			SetPspCoreConfigValue(option.key, values[index]);
+			return;
+		}
 		// 功能设置: 速度相关 + 调试相关。
 		switch (settingsSelection_) {
 		case 0: {
-			static const float kMultipliers[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
-			constexpr int kCount = 5;
+			static const float kMultipliers[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 0.0f};
+			constexpr int kCount = 6;
 			float cur = GetPspFastForwardMultiplier();
-			int idx = 2;
+			int idx = cur <= 0.001f ? kCount - 1 : 2;
 			for (int i = 0; i < kCount; ++i) {
 				if (cur <= kMultipliers[i] + 0.01f) { idx = i; break; }
 			}
@@ -1003,7 +1083,7 @@ void Overlay::CycleSetting(int direction) {
 			displaySettings_.size = DisplaySize::_1x;
 		if (displaySettings_.mode == DisplayMode::Display)
 			displaySettings_.size = DisplaySize::_16_9;
-		ApplyDisplaySettings(true);
+		ApplyDisplaySettings(false);
 		gameDisplaySettingsSaveRequested_ = true;
 		return;
 	}
@@ -1012,7 +1092,7 @@ void Overlay::CycleSetting(int direction) {
 		displaySettings_ = NormalizePpssppDisplaySettingsForCurrentMode(displaySettings_);
 		displaySettings_.size = CycleDisplaySize(displaySettings_.size,
 			&kAspectDisplaySizes[1], 2, direction);
-		ApplyDisplaySettings(true);
+		ApplyDisplaySettings(false);
 		gameDisplaySettingsSaveRequested_ = true;
 		return;
 	}
@@ -1020,7 +1100,7 @@ void Overlay::CycleSetting(int direction) {
 		if (displaySettings_.mode == DisplayMode::Custom) return;
 		const DisplaySize sizes[] = {DisplaySize::_1x, DisplaySize::_2x, DisplaySize::_3x, DisplaySize::_4x};
 		displaySettings_.size = CycleDisplaySize(displaySettings_.size, sizes, 4, direction);
-		ApplyDisplaySettings(true);
+		ApplyDisplaySettings(false);
 		gameDisplaySettingsSaveRequested_ = true;
 		return;
 	}
@@ -1138,7 +1218,7 @@ bool Overlay::HandleSettingsSidebarInput(u64 buttons, u64 pressed, bool navUp, b
 			else
 				displaySettings_.customOffsetY = std::clamp(displaySettings_.customOffsetY +
 					direction / (float)std::max(1, g_display.pixel_yres), 0.0f, 1.0f);
-			ApplyDisplaySettings(true);
+			ApplyDisplaySettings(false);
 			gameDisplaySettingsSaveRequested_ = true;
 		}
 	} else if (!picker && (pressed & HidNpadButton_A)) {
@@ -1282,9 +1362,6 @@ void Overlay::ExecuteSelection() {
 		animTimer_ = kOverlayAnimDuration;
 	} else if (item.action == QuickMenuItem::Action::Resume) {
 		SetVisible(false);
-	} else if (item.action == QuickMenuItem::Action::Reset) {
-		pendingCommand_ = { OverlayAction::Reset, 0 };
-		SetVisible(false);
 	} else {
 		exitRequested_ = true;
 	}
@@ -1292,6 +1369,11 @@ void Overlay::ExecuteSelection() {
 
 bool Overlay::HandleInput(u64 buttons, u64 pressed, int leftStickX, int leftStickY, int rightStickX, int rightStickY,
 	bool menuTogglePressed) {
+	// The exit auto-save needs the active core and GPU to remain alive until
+	// both the state file and its PNG thumbnail have been committed.
+	if (exitSaving_) {
+		return true;
+	}
 	const bool wasVisible = visible_;
 	if (menuTogglePressed) {
 		if (!visible_) {
@@ -1348,6 +1430,38 @@ bool Overlay::HandleInput(u64 buttons, u64 pressed, int leftStickX, int leftStic
 		if (heldV == 0) {
 			dpadNavDir_ = 0;
 			nextDPadNavMs_ = 0;
+		}
+		// LR selectors are intentionally quicker than page navigation, but the
+		// repeat bottoms out at 55 ms to keep the final value controllable.
+		// Restrict this to settings rows so Save State grid navigation and tab
+		// focus retain their existing capped movement speed.
+		if (menu_ == Menu::Settings && !sidebarFocused_ && settingsSidebar_ == SettingsSidebar::None) {
+			const int heldH = ((buttons & (HidNpadButton_Left | HidNpadButton_L)) ? -1 : 0) |
+				((buttons & (HidNpadButton_Right | HidNpadButton_R)) ? 1 : 0);
+			const int pressedH = ((pressed & (HidNpadButton_Left | HidNpadButton_L)) ? -1 : 0) |
+				((pressed & (HidNpadButton_Right | HidNpadButton_R)) ? 1 : 0);
+			if (pressedH != 0) {
+				selectorAdjustDir_ = pressedH;
+				selectorAdjustStartMs_ = nowMs;
+				selectorAdjustNextMs_ = nowMs + 240;
+				navLeft = pressedH < 0;
+				navRight = pressedH > 0;
+			} else if (heldH != 0 && heldH == selectorAdjustDir_ && nowMs >= selectorAdjustNextMs_) {
+				const u64 heldMs = nowMs - selectorAdjustStartMs_;
+				const u64 reduction = heldMs * 12 / 100;
+				const u64 interval = reduction >= 95 ? 55 : 150 - reduction;
+				selectorAdjustNextMs_ = nowMs + interval;
+				navLeft = heldH < 0;
+				navRight = heldH > 0;
+			} else if (heldH == 0) {
+				selectorAdjustDir_ = 0;
+				selectorAdjustStartMs_ = 0;
+				selectorAdjustNextMs_ = 0;
+			}
+		} else {
+			selectorAdjustDir_ = 0;
+			selectorAdjustStartMs_ = 0;
+			selectorAdjustNextMs_ = 0;
 		}
 		// The cheat-list repeat handling fires immediately for a newly held
 		// direction.  Do not apply it while the sidebar still has focus: when
@@ -1425,16 +1539,15 @@ bool Overlay::HandleInput(u64 buttons, u64 pressed, int leftStickX, int leftStic
 		}
 
 		if (sidebarFocused_) {
-			if (navUp) { ActivateTab((tabSelection_ + 7) % 8);  }
-			if (navDown) { ActivateTab((tabSelection_ + 1) % 8);  }
+			if (navUp) { ActivateTab((tabSelection_ + 6) % 7);  }
+			if (navDown) { ActivateTab((tabSelection_ + 1) % 7);  }
 			if (navRight && (menu_ == Menu::SaveStates || menu_ == Menu::Cheats || menu_ == Menu::Settings)) {
 				sidebarFocused_ = false;
 				
 			}
 			if (pressed & HidNpadButton_A) {
 				if (tabSelection_ == 0) { SetVisible(false);  }
-				else if (tabSelection_ == 6) { pendingCommand_ = { OverlayAction::Reset, 0 }; SetVisible(false);  }
-				else if (tabSelection_ == 7) { exitRequested_ = true;  }
+				else if (tabSelection_ == 6) { exitRequested_ = true;  }
 				else if (menu_ == Menu::SaveStates || menu_ == Menu::Cheats || menu_ == Menu::Settings) {
 					sidebarFocused_ = false;
 					
@@ -1559,9 +1672,9 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 	const float height = displaySize.y;
 	const ImVec2 min(0.0f, 0.0f);
 	const ImVec2 max(min.x + width, min.y + height);
-	const std::string tabs[] = {tr("返回游戏"), tr("保存状态"), tr("读取状态"), tr("金手指"), tr("画面设置"), tr("功能设置"), tr("重置游戏"), tr("退出游戏")};
-	const int icons[] = {0xE5C4, 0xE161, 0xE2C6, 0xE3AE, 0xE333, 0xE8B8, 0xE5D5, 0xE879};
-	const std::string descriptions[] = {tr("继续当前游戏。"), tr("创建即时存档。"), tr("读取即时存档。"), tr("管理游戏金手指。"), tr("调整画面、遮罩和着色器。"), tr("调整速度和调试相关核心选项。"), tr("重新启动当前游戏。"), tr("返回 GBAStation。")};
+	const std::string tabs[] = {tr("返回游戏"), tr("保存状态"), tr("读取状态"), tr("金手指"), tr("画面设置"), tr("功能设置"), tr("退出游戏")};
+	const int icons[] = {0xE5C4, 0xE161, 0xE2C6, 0xE3AE, 0xE333, 0xE8B8, 0xE879};
+	const std::string descriptions[] = {tr("继续当前游戏。"), tr("创建即时存档。"), tr("读取即时存档。"), tr("管理游戏金手指。"), tr("调整画面、遮罩和着色器。"), tr("调整速度和调试相关核心选项。"), tr("返回 GBAStation。")};
 	const int active = tabSelection_;
 
 	// 3DS palette
@@ -1604,7 +1717,7 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 	// for the actual controls so the sidebar is easier to read at a distance.
 	const float itemH = 58.0f * scale;
 	const float step = 64.0f * scale;
-	for (int i = 0; i < 8; ++i) {
+	for (int i = 0; i < 7; ++i) {
 		const float y = sidebarY + i * step;
 		const bool selected = i == active;
 		const bool tabFocused = selected && sidebarFocused_;
@@ -1629,10 +1742,6 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 		drawList->AddText(font, 24.0f * scale, ImVec2(sidebarX + 70.0f * scale, textY),
 			selected ? white : muted, tabs[i].c_str());
 	}
-	// Reset separator
-	drawList->AddRectFilled(ImVec2(sidebarX + 18.0f * scale, sidebarY + 6.0f * step - 9.0f * scale),
-		ImVec2(sidebarX + sidebarW - 18.0f * scale, sidebarY + 6.0f * step - 8.0f * scale),
-		IM_COL32(255, 255, 255, (int)(36.0f * ease)));
 	// Divider
 	drawList->AddRectFilled(ImVec2(404.0f * scale, 110.0f * scale),
 		ImVec2(405.0f * scale, 700.0f * scale), IM_COL32(255, 255, 255, (int)(20.0f * ease)));
@@ -1857,14 +1966,32 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 		}
 	} else if (menu_ == Menu::Settings) {
 		char icon[8];
-		if (coreSettingsPage_) {
-			const std::string labels[] = {tr("快进倍率"), tr("快进触发模式"), tr("跳帧"), tr("自动跳帧"),
+	if (coreSettingsPage_) {
+		if (selection_ >= 9) {
+			const int extraSelection = selection_ - 9;
+			const float scroll = std::clamp((float)extraSelection - 4.0f, 0.0f,
+				std::max(0.0f, (float)ARRAY_SIZE(kCoreExtraOptions) - 8.0f));
+			drawSectionHeader(viewTop, tr("高级核心设置"));
+			for (int i = 0; i < (int)ARRAY_SIZE(kCoreExtraOptions); ++i) {
+				const CoreExtraOption &option = kCoreExtraOptions[i];
+				const std::vector<std::string> values = CoreExtraValues(option);
+				std::string value = GetPspCoreConfigValue(option.key, values.front().c_str());
+				if (CoreExtraRequiresRestart(option.key))
+					value += "  " + tr("重启生效");
+				EncodeUtf8(icon, 0xE8B2);
+				drawRow((float)i + 0.55f - scroll, inContent && i == extraSelection, icon,
+					tr(option.label), value, true, true);
+			}
+			return;
+		}
+		const std::string labels[] = {tr("快进倍率"), tr("快进触发模式"), tr("跳帧"), tr("自动跳帧"),
 				tr("跳过缓冲区效果"), tr("渲染重复帧至 60Hz"), tr("垂直同步"), tr("快速内存"), tr("硬件变换")};
 			const int rowIcons[] = {0xE8B2, 0xE8B8, 0xE8B8, 0xE8E5, 0xE428, 0xE8F1, 0xE8F1, 0xE896, 0xE3B6};
 			auto enabled = [](bool value) { return value ? std::string(tr("开启")) : std::string(tr("关闭")); };
 			auto settingValue = [&](int index) {
 				switch (index) {
-				case 0: return std::to_string(static_cast<int>(GetPspFastForwardMultiplier())) + "x";
+				case 0: return GetPspFastForwardMultiplier() <= 0.001f ? std::string(tr("无限")) :
+					std::to_string(static_cast<int>(GetPspFastForwardMultiplier())) + "x";
 				case 1: return GetPspFastForwardToggleMode() ? std::string(tr("切换")) : std::string(tr("按住"));
 				case 2: return g_Config.iFrameSkip == 0 ? std::string(tr("关闭")) : std::to_string(g_Config.iFrameSkip) + tr(" 帧");
 				case 3: return enabled(g_Config.bAutoFrameSkip);
@@ -2075,6 +2202,28 @@ void Overlay::DrawSyncConfirmDialog(ImDrawList *drawList, ImVec2 displaySize, fl
 	drawList->AddText(font, 17.0f * scale, ImVec2(max.x - 94.0f * scale, hintY + 3.0f * scale), IM_COL32(112, 204, 255, 255), tr("确认").c_str());
 }
 
+void Overlay::DrawExitSavingDialog(ImDrawList *drawList, ImVec2 displaySize, float scale, float ease) {
+	if (!exitSaving_ || !drawList) {
+		return;
+	}
+	const float boxW = std::min(510.0f * scale, displaySize.x - 56.0f * scale);
+	const float boxH = 158.0f * scale;
+	const ImVec2 min((displaySize.x - boxW) * 0.5f, (displaySize.y - boxH) * 0.5f);
+	const ImVec2 max(min.x + boxW, min.y + boxH);
+	drawList->AddRectFilled(ImVec2(0, 0), displaySize, IM_COL32(0, 0, 0, (int)(128.0f * ease)));
+	drawList->AddRectFilled(min, max, IM_COL32(15, 31, 45, 248), 8.0f * scale);
+	drawList->AddRect(min, max, IM_COL32(102, 204, 255, 232), 8.0f * scale, 0, 2.0f * scale);
+	ImFont *font = ImGui::GetFont();
+	const std::string title = exitWaitingForNativeSave_ ? tr("正在完成游戏存档") : tr("正在保存");
+	const std::string message = exitWaitingForNativeSave_
+		? tr("请稍候，正在等待游戏完成原生存档写入…")
+		: tr("正在保存即时存档和截图，请稍候…");
+	drawList->AddText(font, 28.0f * scale, ImVec2(min.x + 30.0f * scale, min.y + 31.0f * scale),
+		IM_COL32(240, 247, 255, 255), title.c_str());
+	drawList->AddText(font, 19.0f * scale, ImVec2(min.x + 30.0f * scale, min.y + 85.0f * scale),
+		IM_COL32(194, 218, 236, 255), message.c_str());
+}
+
 void Overlay::DrawRAAlerts(Draw::DrawContext *draw, ImDrawList *drawList, ImVec2 displaySize, float scale, float deltaTime) {
 	auto &notifications = RetroAchievements().Notifications();
 	if (notifications.empty()) {
@@ -2251,6 +2400,7 @@ void Overlay::DrawUI(float width, float height, float deltaTime) {
 		DrawHelpers(drawList, displaySize, scale, ease);
 	}
 	DrawSyncConfirmDialog(drawList, displaySize, scale, ease);
+	DrawExitSavingDialog(drawList, displaySize, scale, ease);
 }
 
 void Overlay::DrawHud(ImDrawList *drawList, float width, float height) {
@@ -2295,9 +2445,10 @@ void Overlay::DrawHud(ImDrawList *drawList, float width, float height) {
 		drawBadge(buf, IM_COL32(104, 255, 145, 255));
 	}
 	if (fastForward) {
-		char buf[16];
-		std::snprintf(buf, sizeof(buf), "%dx >>", static_cast<int>(GetPspFastForwardMultiplier()));
-		drawBadge(buf, IM_COL32(100, 183, 255, 255));
+		const std::string label = GetPspFastForwardMultiplier() <= 0.001f
+			? std::string("∞ >>")
+			: StringFromFormat("%dx >>", static_cast<int>(GetPspFastForwardMultiplier()));
+		drawBadge(label, IM_COL32(100, 183, 255, 255));
 	}
 }
 

@@ -65,6 +65,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdarg>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -226,8 +227,15 @@ std::string Trim(std::string_view value) {
 
 std::string DecodeConfigValue(std::string_view encoded) {
 	std::string value = Trim(encoded);
-	if (value.size() > 2 && value[1] == '|' && value[0] == 's') {
+	if (value.size() > 2 && value[1] == '|') {
+		const char type = value[0];
 		value.erase(0, 2);
+		// Boolean and numeric launcher settings use b| / i| / f|.  They do
+		// not need string unescaping, but the type prefix must never leak into
+		// consumers such as display.showFps.
+		if (type != 's') {
+			return value;
+		}
 		std::string decoded;
 		decoded.reserve(value.size());
 		bool escaped = false;
@@ -402,6 +410,7 @@ void ApplyGBAStationPpssppCoreSettings() {
 	g_Config.iFrameSkip =
 		std::clamp(ConfigInt("core.ppsspp.frameskip", g_Config.iFrameSkip), 0, 8);
 	g_Config.bAutoFrameSkip = ConfigBool("core.ppsspp.auto_frameskip", g_Config.bAutoFrameSkip);
+	g_Config.bRenderDuplicateFrames = ConfigBool("core.ppsspp.render_duplicate_frames", g_Config.bRenderDuplicateFrames);
 	g_Config.bFastMemory = ConfigBool("core.ppsspp.fast_memory", g_Config.bFastMemory);
 	g_Config.iIOTimingMethod = ConfigBool("core.ppsspp.io_thread", true) ? IOTIMING_FAST : IOTIMING_HOST;
 	Log("applied GBAStation PPSSPP config res=%d frameskip=%d auto=%d fastmem=%d io=%d",
@@ -420,6 +429,7 @@ void SaveGBAStationPpssppRuntimeSettings() {
 	raw.SetValue("ppsspp_internal_resolution", std::to_string(std::max(0, g_Config.iInternalResolution)));
 	raw.SetValue("ppsspp_frameskip", std::to_string(std::max(0, g_Config.iFrameSkip)));
 	raw.SetValue("ppsspp_auto_frameskip", enabled(g_Config.bAutoFrameSkip));
+	raw.SetValue("ppsspp_render_duplicate_frames", enabled(g_Config.bRenderDuplicateFrames));
 	raw.SetValue("ppsspp_fast_memory", enabled(g_Config.bFastMemory));
 	raw.SetValue("ppsspp_gpu_hardware_transform", enabled(g_Config.bHardwareTransform));
 	raw.SetValue("ppsspp_skip_buffer_effects", enabled(g_Config.bSkipBufferEffects));
@@ -435,6 +445,8 @@ void ApplyGBAStationPpssppDisplaySettings(DisplaySettings &settings) {
 	const std::string mode = ConfigValue("core.ppsspp.display_mode", "");
 	if (mode == "Integer") {
 		settings.mode = DisplayMode::Integer;
+	} else if (mode == "Custom") {
+		settings.mode = DisplayMode::Custom;
 	} else if (mode == "Display") {
 		settings.mode = DisplayMode::Display;
 	}
@@ -1289,6 +1301,69 @@ std::string NormalizePsRomPath(std::string path) {
     return path;
 }
 
+std::string NormalizeGameDbPath(std::string path) {
+	path = NormalizePsRomPath(std::move(path));
+	return path;
+}
+
+std::string JsonStringOr(const nlohmann::json &item, const char *key, const std::string &fallback = {}) {
+	const auto it = item.find(key);
+	return it != item.end() && it->is_string() ? it->get<std::string>() : fallback;
+}
+
+int JsonIntOr(const nlohmann::json &item, const char *key, int fallback = 0) {
+	const auto it = item.find(key);
+	return it != item.end() && (it->is_number_integer() || it->is_number_unsigned()) ? it->get<int>() : fallback;
+}
+
+bool JsonBoolOr(const nlohmann::json &item, const char *key, bool fallback = false) {
+	const auto it = item.find(key);
+	return it != item.end() && it->is_boolean() ? it->get<bool>() : fallback;
+}
+
+bool WriteGameDbAtomically(const std::string &path, const nlohmann::json &data) {
+	const std::string tempPath = path + ".tmp";
+	{
+		std::ofstream out(tempPath, std::ios::binary | std::ios::trunc);
+		if (!out) {
+			Log("GBAStation GameDB temporary write failed: %s", tempPath.c_str());
+			return false;
+		}
+		out << data.dump(4);
+		out.flush();
+		if (!out) {
+			out.close();
+			std::remove(tempPath.c_str());
+			Log("GBAStation GameDB temporary flush failed: %s", tempPath.c_str());
+			return false;
+		}
+	}
+	if (std::rename(tempPath.c_str(), path.c_str()) == 0) {
+		return true;
+	}
+	// Horizon's FAT layer does not replace an existing destination on rename.
+	// Move the old complete file aside and restore it if promoting the prepared
+	// temporary file fails, so a failed update never leaves GameDB truncated.
+	const std::string backupPath = path + ".bak";
+	if (std::rename(path.c_str(), backupPath.c_str()) != 0) {
+		const int error = errno;
+		std::remove(tempPath.c_str());
+		Log("GBAStation GameDB replace could not stage existing file path=%s errno=%d", path.c_str(), error);
+		return false;
+	}
+	if (std::rename(tempPath.c_str(), path.c_str()) == 0) {
+		std::remove(backupPath.c_str());
+		return true;
+	}
+	const int error = errno;
+	if (std::rename(backupPath.c_str(), path.c_str()) != 0) {
+		Log("GBAStation GameDB restore failed; backup retained path=%s", backupPath.c_str());
+	}
+	std::remove(tempPath.c_str());
+	Log("GBAStation GameDB replace failed path=%s errno=%d", path.c_str(), error);
+	return false;
+}
+
 std::string CurrentPsTimestamp() {
     std::time_t now = std::time(nullptr);
     std::tm local{};
@@ -1301,37 +1376,51 @@ std::string CurrentPsTimestamp() {
 // 启动时一次读入并缓存 GameDB 匹配条目；title/logoPath 的更新直接改缓存，
 // 最后由 FlushPspGameDb 统一写回一次。
 void FlushPspGameDb() {
-    if (!g_state.gameDbLoaded || !g_state.gameDbDirty || g_state.gameDbPath.empty())
-        return;
-    std::ofstream out(g_state.gameDbPath, std::ios::trunc);
-    if (out) {
-        out << g_state.gameDbData.dump(4);
-        Log("GBAStation GameDB flushed %s", g_state.gameDbPath.c_str());
-    } else {
-        Log("GBAStation GameDB write failed: %s", g_state.gameDbPath.c_str());
-    }
-    g_state.gameDbDirty = false;
+	if (!g_state.gameDbLoaded || !g_state.gameDbDirty || g_state.gameDbPath.empty()) {
+		return;
+	}
+	if (WriteGameDbAtomically(g_state.gameDbPath, g_state.gameDbData)) {
+		Log("GBAStation GameDB flushed %s", g_state.gameDbPath.c_str());
+		g_state.gameDbDirty = false;
+	} else {
+		Log("GBAStation GameDB write failed: %s", g_state.gameDbPath.c_str());
+	}
 }
 
 void ApplyPspGameDbDisplaySettings(const nlohmann::json &item) {
 	// These names match the generic GameDB schema already used by FBNeo and
 	// 3DS.  Missing values intentionally leave the user's global defaults in
 	// place, preserving backward compatibility with existing entries.
-	const int displayMode = item.value("displayMode", -1);
-	const int internalResolution = item.value("ndsInternalResolution", -1);
-	const std::string screenLayout = item.value("ndsScreenLayout", std::string());
+	const int displayMode = JsonIntOr(item, "displayMode", -1);
+	const int internalResolution = JsonIntOr(item, "ndsInternalResolution", -1);
+	std::string screenLayout = JsonStringOr(item, "ndsScreenLayout");
+	int integerScale = 0;
+	if (const auto stored = item.find("integerAspectRatio"); stored != item.end() && stored->is_number())
+		integerScale = std::clamp((int)std::lround(stored->get<float>()), 1, 4);
+	else if (const auto legacy = item.find("ndsIntegerScale"); legacy != item.end() &&
+		(legacy->is_number_integer() || legacy->is_number_unsigned()))
+		// One-way migration for older builds that incorrectly wrote the
+		// multiplier into the boolean NDS metadata field.
+		integerScale = std::clamp(JsonIntOr(item, "ndsIntegerScale", 1), 1, 4);
+	if (displayMode == static_cast<int>(DisplayMode::Integer) && integerScale >= 1)
+		screenLayout = std::to_string(integerScale) + "x";
+	const float customScale = std::clamp(item.value("customScale", 1.0f), 0.5f, 5.0f);
+	// GameDB custom offsets are pixel deltas from the centred position.
+	const float customOffsetX = 0.5f + item.value("customOffsetX", 0.0f) / std::max(1, g_display.pixel_xres);
+	const float customOffsetY = 0.5f + item.value("customOffsetY", 0.0f) / std::max(1, g_display.pixel_yres);
 	if (displayMode < 0 && internalResolution < 0 && screenLayout.empty())
 		return;
 	if (g_state.overlay.IsReady())
-		g_state.overlay.SetGameDisplaySettings(displayMode, screenLayout, internalResolution);
+		g_state.overlay.SetGameDisplaySettings(displayMode, screenLayout, internalResolution,
+			customScale, customOffsetX, customOffsetY);
 }
 
 void ApplyPspGameDbShaderSettings(const nlohmann::json &item) {
 	// Slang presets are registered after the graphics host starts.  Unknown or
 	// removed presets are ignored, leaving the regular global setting intact.
-	if (!item.value("shaderEnabled", false))
+	if (!JsonBoolOr(item, "shaderEnabled"))
 		return;
-	const std::string preset = item.value("shaderPath", std::string());
+	const std::string preset = JsonStringOr(item, "shaderPath");
 	if (preset.empty())
 		return;
 	const ShaderInfo *info = GetPostShaderInfo(preset);
@@ -1350,8 +1439,8 @@ void ApplyPspGameDbShaderSettings(const nlohmann::json &item) {
 void ApplyPspGameDbMaskSettings(const nlohmann::json &item) {
 	if (!g_state.overlay.IsReady())
 		return;
-	g_state.overlay.SetGameMaskSettings(item.value("overlayEnabled", false),
-		item.value("overlayPath", std::string()));
+	g_state.overlay.SetGameMaskSettings(JsonBoolOr(item, "overlayEnabled"),
+		NormalizeGameDbPath(JsonStringOr(item, "overlayPath")));
 }
 
 void SavePspGameDbDisplaySettings() {
@@ -1362,10 +1451,26 @@ void SavePspGameDbDisplaySettings() {
 		return;
 	item["displayMode"] = g_state.overlay.GameDisplayModeIndex();
 	item["ndsScreenLayout"] = g_state.overlay.GameScreenLayout();
-	item["ndsInternalResolution"] = std::clamp(g_Config.iInternalResolution, 0, 10);
-	item["ndsIntegerScale"] = g_state.overlay.GameDisplayModeIndex() == static_cast<int>(DisplayMode::Integer);
+	// The shared launcher schema clamps this NDS-named storage field to 1..4.
+	// PPSSPP can still use 5x for the live session, but no fifth persistent
+	// GameDB representation exists without inventing a new field.
+	item["ndsInternalResolution"] = std::clamp(g_Config.iInternalResolution, 1, 4);
+	item["customScale"] = g_state.overlay.GameCustomDisplayScale();
+	item["customOffsetX"] = (g_state.overlay.GameCustomDisplayOffsetX() - 0.5f) * std::max(1, g_display.pixel_xres);
+	item["customOffsetY"] = (g_state.overlay.GameCustomDisplayOffsetY() - 0.5f) * std::max(1, g_display.pixel_yres);
+	const std::string layout = g_state.overlay.GameScreenLayout();
+	const float integerScale = layout == "1x" ? 1.0f : layout == "2x" ? 2.0f : layout == "3x" ? 3.0f : layout == "4x" ? 4.0f : 1.0f;
+	// The launcher deserializes this field as bool; the multiplier belongs in
+	// the schema-approved float integerAspectRatio.
+	item["ndsIntegerScale"] = JsonBoolOr(item, "ndsIntegerScale", true);
+	item["integerAspectRatio"] = integerScale;
+	// These were an earlier PPSSPP-only extension.  Keep GameDB on the shared
+	// schema instead of introducing parallel custom-display keys.
+	item.erase("ppssppCustomScale");
+	item.erase("ppssppCustomOffsetX");
+	item.erase("ppssppCustomOffsetY");
 	item["overlayEnabled"] = g_state.overlay.IsGameMaskEnabled();
-	item["overlayPath"] = g_state.overlay.GameMaskPath();
+	item["overlayPath"] = NormalizeGameDbPath(g_state.overlay.GameMaskPath());
 	g_state.gameDbDirty = true;
 	FlushPspGameDb();
 }
@@ -1385,8 +1490,10 @@ void SavePspGameDbShaderSettings() {
 		}
 	}
 	item["shaderEnabled"] = slang != nullptr;
-	item["shaderPath"] = slang ? slang->section : std::string();
-	item["shaderParaPath"] = slang ? slang->section : std::string();
+	item["shaderPath"] = slang ? NormalizeGameDbPath(slang->section) : std::string();
+	// The shared schema reserves this legacy field for launcher parameter files;
+	// Slang parameters are stored in the arrays below.
+	item["shaderParaPath"] = "";
 	std::vector<std::string> names;
 	std::vector<float> values;
 	if (slang && slang->slangPreset) {
@@ -1402,6 +1509,84 @@ void SavePspGameDbShaderSettings() {
 	item["shaderParaValues"] = std::move(values);
 	g_state.gameDbDirty = true;
 	FlushPspGameDb();
+}
+
+template <typename Apply>
+void SyncPspGameDb(const char *label, Apply apply) {
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size()) {
+		Log("GBAStation GameDB %s sync skipped: no current entry", label);
+		return;
+	}
+	int updated = 0;
+	for (size_t index = 0; index < g_state.gameDbData.size(); ++index) {
+		if (index == g_state.gameDbIndex || !g_state.gameDbData[index].is_object()) {
+			continue;
+		}
+		apply(g_state.gameDbData[index]);
+		++updated;
+	}
+	if (updated == 0) {
+		Log("GBAStation GameDB %s sync: no other PSP entries", label);
+		return;
+	}
+	g_state.gameDbDirty = true;
+	FlushPspGameDb();
+	Log("GBAStation GameDB synced %s to %d other PSP entries", label, updated);
+}
+
+void SyncPspGameDbDisplaySettings() {
+	SavePspGameDbDisplaySettings();
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size()) return;
+	const auto &source = g_state.gameDbData[g_state.gameDbIndex];
+	const int mode = JsonIntOr(source, "displayMode", -1);
+	const int resolution = JsonIntOr(source, "ndsInternalResolution", -1);
+	const std::string layout = JsonStringOr(source, "ndsScreenLayout");
+	const float integerScale = source.value("integerAspectRatio", 1.0f);
+	const float customScale = source.value("customScale", 1.0f);
+	const float customOffsetX = source.value("customOffsetX", 0.0f);
+	const float customOffsetY = source.value("customOffsetY", 0.0f);
+	SyncPspGameDb("display settings", [=](nlohmann::json &item) {
+		item["displayMode"] = mode;
+		item["ndsInternalResolution"] = resolution;
+		item["ndsScreenLayout"] = layout;
+		item["customScale"] = customScale;
+		item["customOffsetX"] = customOffsetX;
+		item["customOffsetY"] = customOffsetY;
+		item["integerAspectRatio"] = integerScale;
+		item["ndsIntegerScale"] = JsonBoolOr(item, "ndsIntegerScale", true);
+		item.erase("ppssppCustomScale");
+		item.erase("ppssppCustomOffsetX");
+		item.erase("ppssppCustomOffsetY");
+	});
+}
+
+void SyncPspGameDbMaskSettings() {
+	SavePspGameDbDisplaySettings();
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size()) return;
+	const auto &source = g_state.gameDbData[g_state.gameDbIndex];
+	const bool enabled = JsonBoolOr(source, "overlayEnabled");
+	const std::string path = NormalizeGameDbPath(JsonStringOr(source, "overlayPath"));
+	SyncPspGameDb("mask settings", [=](nlohmann::json &item) {
+		item["overlayEnabled"] = enabled;
+		item["overlayPath"] = path;
+	});
+}
+
+void SyncPspGameDbShaderSettings() {
+	SavePspGameDbShaderSettings();
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size()) return;
+	const auto &source = g_state.gameDbData[g_state.gameDbIndex];
+	const bool enabled = JsonBoolOr(source, "shaderEnabled");
+	const std::string path = NormalizeGameDbPath(JsonStringOr(source, "shaderPath"));
+	const auto names = source.value("shaderParaNames", std::vector<std::string>{});
+	const auto values = source.value("shaderParaValues", std::vector<float>{});
+	SyncPspGameDb("Slang shader settings", [=](nlohmann::json &item) {
+		item["shaderEnabled"] = enabled;
+		item["shaderPath"] = path;
+		item["shaderParaPath"] = "";
+		item["shaderParaNames"] = names;
+		item["shaderParaValues"] = values;
+	});
 }
 
 void LoadPspPlayStats(const std::string& romPath) {
@@ -1434,21 +1619,29 @@ void LoadPspPlayStats(const std::string& romPath) {
         for (size_t idx = 0; idx < data.size(); ++idx) {
             auto& item = data[idx];
             if (!item.is_object()) continue;
-            const std::string itemPath = item.value("path", std::string());
+            const std::string itemPath = JsonStringOr(item, "path");
             if (itemPath != romPath && NormalizePsRomPath(itemPath) != normalized) continue;
             g_state.playStatsFound = true;
-            g_state.playCount = item.value("playCount", 0) + 1;
-            g_state.playTimeTotal = item.value("playTime", 0);
-            g_state.savePath = item.value("savePath", std::string());
+            g_state.playCount = JsonIntOr(item, "playCount") + 1;
+            g_state.playTimeTotal = JsonIntOr(item, "playTime");
+            g_state.savePath = NormalizeGameDbPath(JsonStringOr(item, "savePath"));
+            // Repair the common sdmc: spelling while this entry is already
+            // being updated for its play counter.  The launcher consumes the
+            // normalized schema paths on its next scan.
+            item["savePath"] = g_state.savePath;
+            item["overlayPath"] = NormalizeGameDbPath(JsonStringOr(item, "overlayPath"));
+            item["shaderPath"] = NormalizeGameDbPath(JsonStringOr(item, "shaderPath"));
+            item["shaderParaPath"] = "";
             item["playCount"] = g_state.playCount;
             g_state.gameDbData = std::move(data);
             g_state.gameDbIndex = idx;
             g_state.gameDbPath = dbPath;
             g_state.gameDbLoaded = true;
-            g_state.gameDbDirty = true;
-			ApplyPspGameDbDisplaySettings(item);
-			ApplyPspGameDbShaderSettings(item);
-			ApplyPspGameDbMaskSettings(item);
+			g_state.gameDbDirty = true;
+			const auto &cachedItem = g_state.gameDbData[g_state.gameDbIndex];
+			ApplyPspGameDbDisplaySettings(cachedItem);
+			ApplyPspGameDbShaderSettings(cachedItem);
+			ApplyPspGameDbMaskSettings(cachedItem);
             Log("GBAStation play stats start playCount=%d playTime=%d", g_state.playCount, g_state.playTimeTotal);
             return;
         }
@@ -1896,9 +2089,18 @@ bool GetPspFastForwardActive() {
 bool GetPspShowFps() {
 	const auto it = g_state.gbastationConfig.find("display.showFps");
 	if (it == g_state.gbastationConfig.end()) {
+		return true;
+	}
+	std::string value = Trim(it->second);
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+		return (char)std::tolower(c);
+	});
+	if (value == "false" || value == "0" || value == "off" || value == "disabled") {
 		return false;
 	}
-	return it->second == "true" || it->second == "1";
+	// Preserve the Flycast/launcher default for true, typed, or malformed
+	// values so a missing/legacy key never makes the FPS HUD disappear.
+	return true;
 }
 
 
@@ -2069,6 +2271,18 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 	}
 	if (g_state.overlay.ConsumeGameDisplaySettingsSaveRequest()) {
 		SavePspGameDbDisplaySettings();
+	}
+	if (g_state.overlay.ConsumeGameShaderSettingsSaveRequest()) {
+		SavePspGameDbShaderSettings();
+	}
+	if (g_state.overlay.ConsumeSyncDisplaySettingsRequest()) {
+		SyncPspGameDbDisplaySettings();
+	}
+	if (g_state.overlay.ConsumeSyncMaskSettingsRequest()) {
+		SyncPspGameDbMaskSettings();
+	}
+	if (g_state.overlay.ConsumeSyncShaderSettingsRequest()) {
+		SyncPspGameDbShaderSettings();
 	}
 	ExecuteOverlayCommand(g_state.overlay.ConsumeCommand());
 	if (g_state.overlay.ShouldExitGame()) {

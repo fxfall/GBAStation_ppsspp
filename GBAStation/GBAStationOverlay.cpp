@@ -3,14 +3,21 @@
 #include "GBAStationAudioSfx.h"
 #include "GBAStationConfig.h"
 #include "GBAStationRetroAchievements.h"
+#include "PpssppRuntime.h"
 #include "GBAStationTranslationManager.h"
 #include "GBAStationUtils.h"
 #include <sys/stat.h>
 #include "Core/Config.h"
+#include "Core/System.h"
+#include "Core/Util/PathUtil.h"
+#include "Common/File/DirListing.h"
+#include "Common/File/FileUtil.h"
 #include "Common/GPU/thin3d.h"
 #include "Common/Math/lin/matrix4x4.h"
 #include "Common/Render/ManagedTexture.h"
+#include "Common/StringUtils.h"
 #include "Common/System/Display.h"
+#include "GPU/Common/PostShader.h"
 #include "ext/imgui/imgui.h"
 #include "ext/imgui/imgui_impl_thin3d.h"
 #define NANOSVG_IMPLEMENTATION
@@ -260,7 +267,9 @@ int GetAvailableIntegerDisplaySizes(DisplaySize *sizes, int sizeCount) {
 }
 
 std::string TranslatedDisplayModeLabel(DisplayMode mode) {
-	return mode == DisplayMode::Integer ? tr("emulator_integer") : tr("emulator_display");
+	if (mode == DisplayMode::Integer) return tr("整数缩放");
+	if (mode == DisplayMode::Custom) return tr("自定义");
+	return tr("适应屏幕");
 }
 
 std::string TranslatedDisplaySizeLabel(DisplaySize size) {
@@ -581,6 +590,24 @@ void Overlay::ReleaseMaskTexture() {
 	}
 }
 
+bool Overlay::ConsumeSyncDisplaySettingsRequest() {
+	const bool requested = syncDisplaySettingsRequested_;
+	syncDisplaySettingsRequested_ = false;
+	return requested;
+}
+
+bool Overlay::ConsumeSyncMaskSettingsRequest() {
+	const bool requested = syncMaskSettingsRequested_;
+	syncMaskSettingsRequested_ = false;
+	return requested;
+}
+
+bool Overlay::ConsumeSyncShaderSettingsRequest() {
+	const bool requested = syncShaderSettingsRequested_;
+	syncShaderSettingsRequested_ = false;
+	return requested;
+}
+
 void Overlay::DrawFlowBorder(ImDrawList *drawList, float x, float y, float w, float h, float thickness) {
 	const float rounding = 0.0f;
 	if (!focusTexture_) {
@@ -639,6 +666,10 @@ void Overlay::Shutdown() {
 	ReleaseRAIconTexture();
 	ReleaseFocusTexture();
 	ReleaseMaskTexture();
+	for (Draw::Texture *texture : retiredMaskTextures_) {
+		texture->Release();
+	}
+	retiredMaskTextures_.clear();
 	for (SlotThumb &thumb : slotThumbs_) {
 		if (thumb.tex) {
 			thumb.tex->Release();
@@ -671,6 +702,14 @@ void Overlay::Shutdown() {
 	cheatsLoadCommandSent_ = false;
 	cheatsLoadingDelayFrames_ = 0;
 	cheats_.clear();
+	syncDisplaySettingsRequested_ = false;
+	syncMaskSettingsRequested_ = false;
+	syncShaderSettingsRequested_ = false;
+	syncConfirm_ = SyncConfirm::None;
+	settingsSidebar_ = SettingsSidebar::None;
+	sidebarSelection_ = 0;
+	pickerEntries_.clear();
+	pickerDirectory_.clear();
 	lastAnalogNavMs_ = 0;
 	nextCheatVerticalNavMs_ = 0;
 	nextCheatHorizontalNavMs_ = 0;
@@ -690,6 +729,8 @@ void Overlay::SetVisible(bool visible) {
 	sidebarFocused_ = true;
 	settingsSelection_ = 0;
 	coreSettingsPage_ = false;
+	settingsSidebar_ = SettingsSidebar::None;
+	sidebarSelection_ = 0;
 	animTimer_ = 0.0f;
 	lastAnalogNavMs_ = 0;
 	nextCheatVerticalNavMs_ = 0;
@@ -752,7 +793,8 @@ void Overlay::ReloadDisplaySettings() {
 	displaySettings_ = LoadPpssppDisplaySettings(log_);
 }
 
-void Overlay::SetGameDisplaySettings(int displayMode, const std::string &screenLayout, int internalResolution) {
+void Overlay::SetGameDisplaySettings(int displayMode, const std::string &screenLayout, int internalResolution,
+	float customScale, float customOffsetX, float customOffsetY) {
 	hasGameDisplaySettings_ = true;
 	if (internalResolution >= 0)
 		g_Config.iInternalResolution = std::clamp(internalResolution, 0, 10);
@@ -761,6 +803,11 @@ void Overlay::SetGameDisplaySettings(int displayMode, const std::string &screenL
 		displaySettings_.mode = DisplayMode::Integer;
 	else if (displayMode == static_cast<int>(DisplayMode::Display))
 		displaySettings_.mode = DisplayMode::Display;
+	else if (displayMode == static_cast<int>(DisplayMode::Custom))
+		displaySettings_.mode = DisplayMode::Custom;
+	displaySettings_.customScale = std::clamp(customScale, 0.5f, 5.0f);
+	displaySettings_.customOffsetX = std::clamp(customOffsetX, 0.0f, 1.0f);
+	displaySettings_.customOffsetY = std::clamp(customOffsetY, 0.0f, 1.0f);
 
 	// GameDB deliberately stores the shared launcher spelling used by the
 	// other cores (ndsScreenLayout).  PPSSPP maps it to its own display enum.
@@ -784,7 +831,10 @@ void Overlay::SetGameMaskSettings(bool enabled, const std::string &path) {
 		return;
 	}
 	gameMaskPath_ = path;
-	ReleaseMaskTexture();
+	if (maskTexture_) {
+		retiredMaskTextures_.push_back(maskTexture_);
+		maskTexture_ = nullptr;
+	}
 	LoadMaskTexture(draw_);
 }
 
@@ -857,7 +907,7 @@ int Overlay::ItemCount() const {
 	if (menu_ == Menu::Cheats) {
 		return std::max(1, (int)cheats_.size());
 	}
-	return coreSettingsPage_ ? 5 : 9;
+	return coreSettingsPage_ ? 9 : 13;
 }
 
 void Overlay::ApplyDisplaySettings(bool save) {
@@ -874,12 +924,9 @@ void Overlay::CycleSetting(int direction) {
 	}
 
 	if (coreSettingsPage_) {
-		// 功能设置: 非画面项目（快速内存/硬件变换/跳缓冲 + 快进）。
+		// 功能设置: 速度相关 + 调试相关。
 		switch (settingsSelection_) {
-		case 0: g_Config.bFastMemory = !g_Config.bFastMemory; break;
-		case 1: g_Config.bHardwareTransform = !g_Config.bHardwareTransform; break;
-		case 2: g_Config.bSkipBufferEffects = !g_Config.bSkipBufferEffects; break;
-		case 3: {
+		case 0: {
 			static const float kMultipliers[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
 			constexpr int kCount = 5;
 			float cur = GetPspFastForwardMultiplier();
@@ -891,53 +938,211 @@ void Overlay::CycleSetting(int direction) {
 			SetPspFastForwardMultiplier(kMultipliers[idx]);
 			break;
 		}
-		case 4:
+		case 1:
 			SetPspFastForwardToggleMode(!GetPspFastForwardToggleMode());
 			break;
+		case 2: g_Config.iFrameSkip = (g_Config.iFrameSkip + direction + 9) % 9; break;
+		case 3: g_Config.bAutoFrameSkip = !g_Config.bAutoFrameSkip; break;
+		case 4: g_Config.bSkipBufferEffects = !g_Config.bSkipBufferEffects; break;
+		case 5:
+			// PPSSPP's own UI only enables this while normal buffered rendering
+			// is active and manual frame skip is off.
+			if (!g_Config.bSkipBufferEffects && g_Config.iFrameSkip == 0)
+				g_Config.bRenderDuplicateFrames = !g_Config.bRenderDuplicateFrames;
+			break;
+		case 6: g_Config.bVSync = !g_Config.bVSync; break;
+		case 7: g_Config.bFastMemory = !g_Config.bFastMemory; break;
+		case 8: g_Config.bHardwareTransform = !g_Config.bHardwareTransform; break;
 		default: break;
 		}
 		coreSettingsChanged_ = true;
 		return;
 	}
-	// 画面设置 page: 渲染分辨率 + 显示模式/比例 + 画面相关核心项。
+	// 画面设置 page.
 	if (settingsSelection_ == 0) {
-		g_Config.iInternalResolution = std::clamp(g_Config.iInternalResolution + direction, 0, 5);
+		int resolution = g_Config.iInternalResolution;
+		if (resolution < 1 || resolution > 5) resolution = 1;
+		resolution = (resolution - 1 + direction + 5) % 5 + 1;
+		g_Config.iInternalResolution = resolution;
 		coreSettingsChanged_ = true;
 		gameDisplaySettingsSaveRequested_ = true;
 		return;
 	}
 	if (settingsSelection_ == 1) {
-		displaySettings_ = NormalizePpssppDisplaySettingsForCurrentMode(displaySettings_);
-		displaySettings_.mode = displaySettings_.mode == DisplayMode::Integer ? DisplayMode::Display : DisplayMode::Integer;
-		displaySettings_.size = displaySettings_.mode == DisplayMode::Integer ? DisplaySize::Auto : DisplaySize::_16_9;
+		int mode = (static_cast<int>(displaySettings_.mode) + direction + 3) % 3;
+		displaySettings_.mode = static_cast<DisplayMode>(mode);
+		if (displaySettings_.mode == DisplayMode::Integer)
+			displaySettings_.size = DisplaySize::_1x;
+		if (displaySettings_.mode == DisplayMode::Display)
+			displaySettings_.size = DisplaySize::_16_9;
 		ApplyDisplaySettings(true);
 		gameDisplaySettingsSaveRequested_ = true;
 		return;
 	}
 	if (settingsSelection_ == 2) {
+		if (displaySettings_.mode == DisplayMode::Custom) return;
 		displaySettings_ = NormalizePpssppDisplaySettingsForCurrentMode(displaySettings_);
-		if (displaySettings_.mode == DisplayMode::Integer) {
-			DisplaySize integerSizes[5];
-			const int integerSizeCount = GetAvailableIntegerDisplaySizes(integerSizes, (int)(sizeof(integerSizes) / sizeof(integerSizes[0])));
-			displaySettings_.size = CycleDisplaySize(displaySettings_.size, integerSizes, integerSizeCount, direction);
-		} else {
-			displaySettings_.size = CycleDisplaySize(displaySettings_.size, kAspectDisplaySizes,
-				(int)(sizeof(kAspectDisplaySizes) / sizeof(kAspectDisplaySizes[0])), direction);
-		}
+		displaySettings_.size = CycleDisplaySize(displaySettings_.size,
+			&kAspectDisplaySizes[1], 2, direction);
+		ApplyDisplaySettings(true);
+		gameDisplaySettingsSaveRequested_ = true;
+		return;
+	}
+	if (settingsSelection_ == 3) {
+		if (displaySettings_.mode == DisplayMode::Custom) return;
+		const DisplaySize sizes[] = {DisplaySize::_1x, DisplaySize::_2x, DisplaySize::_3x, DisplaySize::_4x};
+		displaySettings_.size = CycleDisplaySize(displaySettings_.size, sizes, 4, direction);
 		ApplyDisplaySettings(true);
 		gameDisplaySettingsSaveRequested_ = true;
 		return;
 	}
 	switch (settingsSelection_) {
-	case 3: g_Config.iFrameSkip = (g_Config.iFrameSkip + direction + 6) % 6; break;
-	case 4: g_Config.bAutoFrameSkip = !g_Config.bAutoFrameSkip; break;
-	case 5: g_Config.bVSync = !g_Config.bVSync; break;
-	case 6: g_Config.iTexFiltering = g_Config.iTexFiltering >= 4 ? 1 : g_Config.iTexFiltering + 1; break;
-	case 7: g_Config.iAnisotropyLevel = (g_Config.iAnisotropyLevel + direction + 5) % 5; break;
-	case 8: g_Config.bTexDeposterize = !g_Config.bTexDeposterize; break;
+	case 5: g_Config.iTexFiltering = (g_Config.iTexFiltering + direction + 5) % 5; break;
+	case 6: g_Config.iAnisotropyLevel = (g_Config.iAnisotropyLevel + direction + 5) % 5; break;
+	case 7: g_Config.bTexDeposterize = !g_Config.bTexDeposterize; break;
 	default: break;
 	}
 	coreSettingsChanged_ = true;
+}
+
+void Overlay::OpenSettingsSidebar(SettingsSidebar sidebar) {
+	settingsSidebar_ = sidebar;
+	sidebarSelection_ = 0;
+	sidebarAdjustDir_ = 0;
+	sidebarAdjustStartMs_ = 0;
+	sidebarAdjustNextMs_ = 0;
+	if (sidebar == SettingsSidebar::MaskPicker) {
+		pickerDirectory_ = gameMaskPath_.empty() ? Path(kPpssppDataRoot).ToString() : Path(gameMaskPath_).GetDirectory();
+		ReloadPickerEntries();
+	} else if (sidebar == SettingsSidebar::ShaderPicker) {
+		pickerDirectory_ = GetSysDirectory(DIRECTORY_CUSTOM_SHADERS).ToString();
+		ReloadPickerEntries();
+	}
+}
+
+void Overlay::ReloadPickerEntries() {
+	pickerEntries_.clear();
+	if (pickerDirectory_.empty()) return;
+	const Path directory(pickerDirectory_);
+	if (directory.CanNavigateUp()) {
+		pickerEntries_.push_back({"..", directory.NavigateUp().ToString(), true});
+	}
+	std::vector<File::FileInfo> files;
+	if (!File::GetFilesInDir(directory, &files)) return;
+	const bool shaderPicker = settingsSidebar_ == SettingsSidebar::ShaderPicker;
+	for (const File::FileInfo &file : files) {
+		if (file.isDirectory) {
+			pickerEntries_.push_back({file.name + "/", file.fullName.ToString(), true});
+			continue;
+		}
+		const std::string extension = Path(file.name).GetFileExtension();
+		if ((shaderPicker && extension == ".slangp") || (!shaderPicker && extension == ".png"))
+			pickerEntries_.push_back({file.name, file.fullName.ToString(), false});
+	}
+	std::sort(pickerEntries_.begin() + (pickerEntries_.empty() ? 0 : (pickerEntries_[0].label == ".." ? 1 : 0)),
+		pickerEntries_.end(), [](const PickerEntry &a, const PickerEntry &b) {
+			if (a.directory != b.directory) return a.directory;
+			return a.label < b.label;
+		});
+}
+
+bool Overlay::HandleSettingsSidebarInput(u64 buttons, u64 pressed, bool navUp, bool navDown, bool navLeft, bool navRight) {
+	const bool picker = settingsSidebar_ == SettingsSidebar::MaskPicker || settingsSidebar_ == SettingsSidebar::ShaderPicker;
+	const int count = picker ? (int)pickerEntries_.size() : (settingsSidebar_ == SettingsSidebar::Custom ? 3 : 2);
+	if (count > 0) {
+		if (navUp) sidebarSelection_ = (sidebarSelection_ + count - 1) % count;
+		if (navDown) sidebarSelection_ = (sidebarSelection_ + 1) % count;
+	}
+	if (settingsSidebar_ == SettingsSidebar::Custom) {
+		const int heldDirection = ((buttons & (HidNpadButton_Left | HidNpadButton_L)) ? -1 : 0) |
+			((buttons & (HidNpadButton_Right | HidNpadButton_R)) ? 1 : 0);
+		int direction = 0;
+		const u64 nowMs = CurrentTimeMs();
+		if (heldDirection == 0) {
+			sidebarAdjustDir_ = 0;
+			sidebarAdjustStartMs_ = 0;
+			sidebarAdjustNextMs_ = 0;
+		} else if (heldDirection != sidebarAdjustDir_) {
+			sidebarAdjustDir_ = heldDirection;
+			sidebarAdjustStartMs_ = nowMs;
+			sidebarAdjustNextMs_ = nowMs + 280;
+			direction = heldDirection;
+		} else if (nowMs >= sidebarAdjustNextMs_) {
+			// Accelerate while held, but never exceed a 55 ms repeat rate.
+			const u64 heldMs = nowMs - sidebarAdjustStartMs_;
+			const u64 reduction = heldMs * 12 / 100;
+			const u64 interval = reduction >= 95 ? 55 : 150 - reduction;
+			sidebarAdjustNextMs_ = nowMs + interval;
+			direction = heldDirection;
+		}
+		// A synthetic press (for example from an analog navigation source) is
+		// still accepted when no physical selector direction is held.
+		if (direction == 0 && heldDirection == 0)
+			direction = navLeft ? -1 : (navRight ? 1 : 0);
+		if (direction != 0) {
+			if (sidebarSelection_ == 0)
+				displaySettings_.customScale = std::clamp(displaySettings_.customScale + direction * 0.1f, 0.5f, 5.0f);
+			else if (sidebarSelection_ == 1)
+				displaySettings_.customOffsetX = std::clamp(displaySettings_.customOffsetX +
+					direction / (float)std::max(1, g_display.pixel_xres), 0.0f, 1.0f);
+			else
+				displaySettings_.customOffsetY = std::clamp(displaySettings_.customOffsetY +
+					direction / (float)std::max(1, g_display.pixel_yres), 0.0f, 1.0f);
+			ApplyDisplaySettings(true);
+			gameDisplaySettingsSaveRequested_ = true;
+		}
+	} else if (!picker && (pressed & HidNpadButton_A)) {
+		if (sidebarSelection_ == 0) {
+			if (settingsSidebar_ == SettingsSidebar::Mask) {
+				gameMaskEnabled_ = !gameMaskEnabled_;
+				gameDisplaySettingsSaveRequested_ = true;
+			} else {
+				g_Config.vPostShaderNames.clear();
+				gameShaderSettingsSaveRequested_ = true;
+				System_PostUIMessage(UIMessage::GPU_CONFIG_CHANGED);
+			}
+		} else if (sidebarSelection_ == 1) {
+			OpenSettingsSidebar(settingsSidebar_ == SettingsSidebar::Mask ? SettingsSidebar::MaskPicker : SettingsSidebar::ShaderPicker);
+			return true;
+		}
+	}
+	if (picker && (pressed & HidNpadButton_A) && sidebarSelection_ >= 0 && sidebarSelection_ < (int)pickerEntries_.size()) {
+		const PickerEntry &entry = pickerEntries_[sidebarSelection_];
+		if (entry.directory) {
+			pickerDirectory_ = entry.path;
+			ReloadPickerEntries();
+			sidebarSelection_ = 0;
+		} else if (settingsSidebar_ == SettingsSidebar::MaskPicker) {
+			SetGameMaskSettings(true, entry.path);
+			gameDisplaySettingsSaveRequested_ = true;
+			OpenSettingsSidebar(SettingsSidebar::Mask);
+		} else {
+			ReloadAllPostShaderInfo(draw_);
+			std::string section = Path(entry.path).GetFilename();
+			const size_t dot = section.rfind('.');
+			if (dot != std::string::npos) section.resize(dot);
+			for (const ShaderInfo &shader : GetAllPostShaderInfo()) {
+				if (shader.isSlang && shader.section == section) {
+					g_Config.vPostShaderNames.assign(1, shader.section);
+					FixPostShaderOrder(&g_Config.vPostShaderNames);
+					gameShaderSettingsSaveRequested_ = true;
+					System_PostUIMessage(UIMessage::GPU_CONFIG_CHANGED);
+					break;
+				}
+			}
+			OpenSettingsSidebar(SettingsSidebar::Shader);
+		}
+		return true;
+	}
+	if (pressed & HidNpadButton_B) {
+		if (settingsSidebar_ == SettingsSidebar::MaskPicker) OpenSettingsSidebar(SettingsSidebar::Mask);
+		else if (settingsSidebar_ == SettingsSidebar::ShaderPicker) OpenSettingsSidebar(SettingsSidebar::Shader);
+		else settingsSidebar_ = SettingsSidebar::None;
+		sidebarAdjustDir_ = 0;
+		sidebarAdjustStartMs_ = 0;
+		sidebarAdjustNextMs_ = 0;
+	}
+	return true;
 }
 
 void Overlay::ExecuteSelection() {
@@ -947,6 +1152,19 @@ void Overlay::ExecuteSelection() {
 	}
 
 	if (menu_ == Menu::Settings) {
+		if (!coreSettingsPage_) {
+			switch (settingsSelection_) {
+			case 4:
+				if (displaySettings_.mode == DisplayMode::Custom) OpenSettingsSidebar(SettingsSidebar::Custom);
+				return;
+			case 8: OpenSettingsSidebar(SettingsSidebar::Mask); return;
+			case 9: OpenSettingsSidebar(SettingsSidebar::Shader); return;
+			case 10: syncConfirm_ = SyncConfirm::Display; return;
+			case 11: syncConfirm_ = SyncConfirm::Shader; return;
+			case 12: syncConfirm_ = SyncConfirm::Mask; return;
+			default: break;
+			}
+		}
 		CycleSetting(1);
 		return;
 	}
@@ -1014,6 +1232,20 @@ bool Overlay::HandleInput(u64 buttons, u64 pressed, int leftStickX, int leftStic
 	}
 
 	if (visible_) {
+		if (syncConfirm_ != SyncConfirm::None) {
+			if (pressed & HidNpadButton_A) {
+				switch (syncConfirm_) {
+				case SyncConfirm::Display: syncDisplaySettingsRequested_ = true; break;
+				case SyncConfirm::Mask: syncMaskSettingsRequested_ = true; break;
+				case SyncConfirm::Shader: syncShaderSettingsRequested_ = true; break;
+				default: break;
+				}
+				syncConfirm_ = SyncConfirm::None;
+			} else if (pressed & HidNpadButton_B) {
+				syncConfirm_ = SyncConfirm::None;
+			}
+			return true;
+		}
 		const int itemCount = ItemCount();
 		bool navUp = (pressed & HidNpadButton_Up) != 0;
 		bool navDown = (pressed & HidNpadButton_Down) != 0;
@@ -1036,8 +1268,8 @@ bool Overlay::HandleInput(u64 buttons, u64 pressed, int leftStickX, int leftStic
 		} else if (heldV != 0 && dpadNavDir_ == heldV && nowMs >= nextDPadNavMs_) {
 			const u64 heldMs = nowMs - dpadNavStartMs_;
 			u64 interval = 128 - heldMs * 12 / 100;
-			if (interval < 48) {
-				interval = 48;
+			if (interval < 80) {
+				interval = 80;
 			}
 			nextDPadNavMs_ = nowMs + interval;
 			navUp = heldV < 0;
@@ -1116,6 +1348,10 @@ bool Overlay::HandleInput(u64 buttons, u64 pressed, int leftStickX, int leftStic
 			} else {
 				lastAnalogNavMs_ = 0;
 			}
+		}
+
+		if (settingsSidebar_ != SettingsSidebar::None) {
+			return HandleSettingsSidebarInput(buttons, pressed, navUp, navDown, navLeft, navRight);
 		}
 
 		if (sidebarFocused_) {
@@ -1255,7 +1491,7 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 	const ImVec2 max(min.x + width, min.y + height);
 	const std::string tabs[] = {tr("返回游戏"), tr("保存状态"), tr("读取状态"), tr("金手指"), tr("画面设置"), tr("功能设置"), tr("重置游戏"), tr("退出游戏")};
 	const int icons[] = {0xE5C4, 0xE161, 0xE2C6, 0xE3AE, 0xE333, 0xE8B8, 0xE5D5, 0xE879};
-	const std::string descriptions[] = {tr("继续当前游戏。"), tr("创建即时存档。"), tr("读取即时存档。"), tr("管理游戏金手指。"), tr("调整渲染分辨率和画面比例。"), tr("调整可即时生效的核心选项。"), tr("重新启动当前游戏。"), tr("返回 GBAStation。")};
+	const std::string descriptions[] = {tr("继续当前游戏。"), tr("创建即时存档。"), tr("读取即时存档。"), tr("管理游戏金手指。"), tr("调整画面、遮罩和着色器。"), tr("调整速度和调试相关核心选项。"), tr("重新启动当前游戏。"), tr("返回 GBAStation。")};
 	const int active = tabSelection_;
 
 	// 3DS palette
@@ -1294,6 +1530,8 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 	const float sidebarX = 48.0f * scale;
 	const float sidebarY = 116.0f * scale;
 	const float sidebarW = 336.0f * scale;
+	// Keep the room below Exit empty but use the fuller Flycast tab treatment
+	// for the actual controls so the sidebar is easier to read at a distance.
 	const float itemH = 58.0f * scale;
 	const float step = 64.0f * scale;
 	for (int i = 0; i < 8; ++i) {
@@ -1313,12 +1551,12 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 				drawList->AddRect(itemMin, itemMax, focusBorder, 0.0f, 0, 1.0f * scale);
 			}
 		}
-		const float textY = y + itemH * 0.5f - 21.0f * scale * 0.43f;
+		const float textY = y + itemH * 0.5f - 24.0f * scale * 0.43f;
 		char iconBuf[8];
 		EncodeUtf8(iconBuf, icons[i]);
-		drawList->AddText(font, 25.0f * scale, ImVec2(sidebarX + 34.0f * scale, y + itemH * 0.5f - 12.5f * scale),
+		drawList->AddText(font, 29.0f * scale, ImVec2(sidebarX + 30.0f * scale, y + itemH * 0.5f - 14.5f * scale),
 			selected ? white : muted, iconBuf);
-		drawList->AddText(font, 21.0f * scale, ImVec2(sidebarX + 64.0f * scale, textY),
+		drawList->AddText(font, 24.0f * scale, ImVec2(sidebarX + 70.0f * scale, textY),
 			selected ? white : muted, tabs[i].c_str());
 	}
 	// Reset separator
@@ -1327,7 +1565,7 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 		IM_COL32(255, 255, 255, (int)(36.0f * ease)));
 	// Divider
 	drawList->AddRectFilled(ImVec2(404.0f * scale, 110.0f * scale),
-		ImVec2(405.0f * scale, 610.0f * scale), IM_COL32(255, 255, 255, (int)(20.0f * ease)));
+		ImVec2(405.0f * scale, 700.0f * scale), IM_COL32(255, 255, 255, (int)(20.0f * ease)));
 
 	// Content area
 	const float contentX = 432.0f * scale;
@@ -1336,8 +1574,8 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 	const float viewTop = 176.0f * scale;
 	const float viewBottom = 664.0f * scale;
 	const float targetCenter = 420.0f * scale;
-	const float rowH = 50.0f * scale;
-	const float rowGap = 7.0f * scale;
+	const float rowH = 42.0f * scale;
+	const float rowGap = 4.0f * scale;
 
 	// Header + title underline
 	drawList->AddText(font, 27.0f * scale, ImVec2(contentX, 116.0f * scale), white, tabs[active].c_str());
@@ -1345,20 +1583,22 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 		ImVec2(contentX + contentW, 163.0f * scale), IM_COL32(0, 122, 204, (int)(71.0f * ease)));
 
 	// Rows with the selection kept centred inside [viewTop, viewBottom].
-	auto drawRow = [&](int row, bool focused, const char *iconUtf8, const std::string &label,
-		const std::string &value, bool selector) {
-		const float y = viewTop + row * (rowH + rowGap);
+	auto drawRow = [&](float row, bool focused, const char *iconUtf8, const std::string &label,
+		const std::string &value, bool selector, bool enabled = true) {
+		float y = viewTop + row * (rowH + rowGap);
 		if (y + rowH < viewTop || y > viewBottom) {
 			return;
 		}
 		const ImVec2 rowMin(contentX, y), rowMax(contentX + contentW, y + rowH);
-		drawList->AddRectFilled(rowMin, rowMax, focused ? focusBg : rowBg);
+		const ImU32 disabledText = IM_COL32(128, 143, 156, (int)(145.0f * ease));
+		const ImU32 disabledValue = IM_COL32(108, 126, 140, (int)(135.0f * ease));
+		drawList->AddRectFilled(rowMin, rowMax, focused && enabled ? focusBg : rowBg);
 		// A restrained top sheen and leading accent make the outlined settings
 		// rows feel like controls without competing with their labels.
 		drawList->AddLine(ImVec2(rowMin.x + 1.0f * scale, rowMin.y + 1.0f * scale),
 			ImVec2(rowMax.x - 1.0f * scale, rowMin.y + 1.0f * scale), rowHighlight, 1.0f * scale);
-		drawList->AddRectFilled(rowMin, ImVec2(rowMin.x + (focused ? 4.0f : 2.0f) * scale, rowMax.y),
-			focused ? cyan : IM_COL32(91, 163, 201, (int)(100.0f * ease)));
+		drawList->AddRectFilled(rowMin, ImVec2(rowMin.x + (focused && enabled ? 4.0f : 2.0f) * scale, rowMax.y),
+			focused && enabled ? cyan : (enabled ? IM_COL32(91, 163, 201, (int)(100.0f * ease)) : disabledValue));
 		if (focused) {
 			if (focusTexture_) {
 				DrawFlowBorder(drawList, contentX, y, contentW, rowH, 3.0f * scale);
@@ -1369,16 +1609,17 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 			drawList->AddRect(rowMin, rowMax, rowBorder, 0.0f, 0, 1.0f * scale);
 		}
 		drawList->AddText(font, 20.0f * scale, ImVec2(contentX + 24.0f * scale, y + rowH * 0.5f - 20.0f * scale * 0.43f),
-			selector ? cyan : (focused ? white : muted), iconUtf8);
+			enabled ? (selector ? cyan : (focused ? white : muted)) : disabledText, iconUtf8);
 		drawList->AddText(font, 20.0f * scale, ImVec2(contentX + 46.0f * scale, y + rowH * 0.5f - 20.0f * scale * 0.43f),
-			focused ? white : muted, label.c_str());
+			enabled ? (focused ? white : muted) : disabledText, label.c_str());
 		if (selector) {
 			// LR value selector: L / value / R like the 3DS page.
 			char iconL[8], iconR[8];
 			EncodeUtf8(iconL, 0xE0E4);
 			EncodeUtf8(iconR, 0xE0E5);
+			const ImU32 selectorColor = enabled ? cyan : disabledValue;
 			drawList->AddText(font, 26.0f * scale, ImVec2(contentX + contentW - 208.0f * scale, y + rowH * 0.5f - 26.0f * scale * 0.43f),
-				cyan, iconL);
+				selectorColor, iconL);
 			// Value with truncation + focus-scroll for long text.
 			const float valueSize = 18.0f * scale;
 			const float valueCenterX = contentX + contentW - 122.0f * scale;
@@ -1387,8 +1628,8 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 			if (valueW <= valueMaxW) {
 				drawList->AddText(font, valueSize,
 					ImVec2(valueCenterX - valueW * 0.5f, y + rowH * 0.5f - valueSize * 0.43f),
-					cyan, value.c_str());
-			} else if (focused) {
+					selectorColor, value.c_str());
+			} else if (focused && enabled) {
 				// Focus-scroll: slide the text through the fixed window.
 				const float scroll = std::fmod((float)(CurrentTimeMs() % 8000) / 1000.0f, 1.0f);
 				const float travel = valueW + valueMaxW;
@@ -1397,7 +1638,7 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 					ImVec2(valueCenterX + valueMaxW * 0.5f, y + rowH), true);
 				drawList->AddText(font, valueSize,
 					ImVec2(valueCenterX - valueW * 0.5f + offset, y + rowH * 0.5f - valueSize * 0.43f),
-					cyan, value.c_str());
+					selectorColor, value.c_str());
 				drawList->PopClipRect();
 			} else {
 				// Truncate with an ellipsis when idle.
@@ -1410,15 +1651,28 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 				const float cw = font->CalcTextSizeA(valueSize, 10000.0f, 0.0f, clipped.c_str()).x;
 				drawList->AddText(font, valueSize,
 					ImVec2(valueCenterX - cw * 0.5f, y + rowH * 0.5f - valueSize * 0.43f),
-					cyan, clipped.c_str());
+					selectorColor, clipped.c_str());
 			}
 			drawList->AddText(font, 26.0f * scale, ImVec2(contentX + contentW - 38.0f * scale, y + rowH * 0.5f - 26.0f * scale * 0.43f),
-				cyan, iconR);
+				selectorColor, iconR);
 		} else {
 			const float valueW = font->CalcTextSizeA(18.0f * scale, 10000.0f, 0.0f, value.c_str()).x;
 			drawList->AddText(font, 18.0f * scale, ImVec2(contentX + contentW - valueW - 18.0f * scale, y + rowH * 0.5f - 18.0f * scale * 0.43f),
-				cyan, value.c_str());
+			enabled ? cyan : disabledValue, value.c_str());
 		}
+	};
+	// Match Flycast's section-header construction: a single cyan rule passes
+	// behind a centred, opaque header label.
+	auto drawSectionHeader = [&](float y, const std::string &label) {
+		const float lineY = y + rowH * 0.5f;
+		const ImVec2 labelSize = font->CalcTextSizeA(16.0f * scale, 10000.0f, 0.0f, label.c_str());
+		const float labelX = contentX + (contentW - labelSize.x) * 0.5f;
+		drawList->AddLine(ImVec2(contentX, lineY), ImVec2(contentX + contentW, lineY),
+			IM_COL32(92, 166, 218, (int)(120.0f * ease)), 1.0f * scale);
+		drawList->AddRectFilled(ImVec2(labelX - 12.0f * scale, lineY - 13.0f * scale),
+			ImVec2(labelX + labelSize.x + 12.0f * scale, lineY + 13.0f * scale),
+			IM_COL32(17, 29, 43, (int)(230.0f * ease)));
+		drawList->AddText(font, 16.0f * scale, ImVec2(labelX, lineY - 16.0f * scale * 0.43f), cyan, label.c_str());
 	};
 
 	const bool inContent = !sidebarFocused_;
@@ -1534,60 +1788,77 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 	} else if (menu_ == Menu::Settings) {
 		char icon[8];
 		if (coreSettingsPage_) {
-			// 功能设置: 非画面项目。
-			const std::string labels[] = {
-				tr("快速内存"), tr("硬件变换"), tr("跳过缓冲区效果"),
-				tr("快进倍率"), tr("快进模式")};
-			const int rowIcons[] = {0xE896, 0xE3B6, 0xE428, 0xE8B2, 0xE8B8};
+			const std::string labels[] = {tr("快进倍率"), tr("快进触发模式"), tr("跳帧"), tr("自动跳帧"),
+				tr("跳过缓冲区效果"), tr("渲染重复帧至 60Hz"), tr("垂直同步"), tr("快速内存"), tr("硬件变换")};
+			const int rowIcons[] = {0xE8B2, 0xE8B8, 0xE8B8, 0xE8E5, 0xE428, 0xE8F1, 0xE8F1, 0xE896, 0xE3B6};
 			auto enabled = [](bool value) { return value ? std::string(tr("开启")) : std::string(tr("关闭")); };
 			auto settingValue = [&](int index) {
 				switch (index) {
-				case 0: return enabled(g_Config.bFastMemory);
-				case 1: return enabled(g_Config.bHardwareTransform);
-				case 2: return enabled(g_Config.bSkipBufferEffects);
-				case 3: return std::to_string(static_cast<int>(GetPspFastForwardMultiplier())) + "x";
-				default: return GetPspFastForwardToggleMode() ? std::string(tr("切换")) : std::string(tr("按住"));
+				case 0: return std::to_string(static_cast<int>(GetPspFastForwardMultiplier())) + "x";
+				case 1: return GetPspFastForwardToggleMode() ? std::string(tr("切换")) : std::string(tr("按住"));
+				case 2: return g_Config.iFrameSkip == 0 ? std::string(tr("关闭")) : std::to_string(g_Config.iFrameSkip) + tr(" 帧");
+				case 3: return enabled(g_Config.bAutoFrameSkip);
+				case 4: return enabled(g_Config.bSkipBufferEffects);
+				case 5: return enabled(g_Config.bRenderDuplicateFrames);
+				case 6: return enabled(g_Config.bVSync);
+				case 7: return enabled(g_Config.bFastMemory);
+				default: return enabled(g_Config.bHardwareTransform);
 				}
 			};
-			const int total = 5;
-			const int visible = std::min(8, total);
-			const int first = std::clamp(selection_ - visible / 2, 0, std::max(0, total - visible));
-			for (int row = 0; row < visible; ++row) {
-				const int index = first + row;
+			const float positions[] = {0.55f, 1.55f, 2.55f, 3.55f, 4.55f, 5.55f, 7.55f, 8.55f, 9.55f};
+			const float scroll = std::clamp(positions[selection_] - 4.0f, 0.0f, 2.0f);
+			drawSectionHeader(viewTop + (0.0f - scroll) * (rowH + rowGap), tr("速度相关"));
+			drawSectionHeader(viewTop + (7.0f - scroll) * (rowH + rowGap), tr("调试相关"));
+			for (int index = 0; index < 9; ++index) {
 				EncodeUtf8(icon, rowIcons[index]);
-				drawRow(row, inContent && index == selection_, icon, labels[index],
-					settingValue(index), true);
+				const bool rowEnabled = index != 5 || (!g_Config.bSkipBufferEffects && g_Config.iFrameSkip == 0);
+				drawRow(positions[index] - scroll, inContent && index == selection_, icon, labels[index],
+					settingValue(index), true, rowEnabled);
+			}
+			const float noticeY = viewTop + (positions[5] - scroll) * (rowH + rowGap) + rowH + 3.0f * scale;
+			if (noticeY >= viewTop && noticeY <= viewBottom) {
+				const ImU32 noticeColor = (!g_Config.bSkipBufferEffects && g_Config.iFrameSkip == 0)
+					? IM_COL32(157, 190, 215, (int)(190.0f * ease)) : IM_COL32(118, 133, 145, (int)(155.0f * ease));
+				drawList->AddText(font, 13.0f * scale, ImVec2(contentX + 12.0f * scale, noticeY), noticeColor,
+					tr("渲染重复帧至 60Hz仅在未跳过缓冲区效果且跳帧关闭时可用").c_str());
 			}
 		} else {
-			// 画面设置: 分辨率/显示模式/比例 + 画面相关核心项。
-			const std::string labels[] = {tr("渲染分辨率"), tr("显示模式"), tr("画面比例"),
-				tr("跳帧"), tr("自动跳帧"), tr("垂直同步"), tr("纹理过滤"), tr("各向异性过滤"), tr("纹理去色带")};
-			const int rowIcons[] = {0xE333, 0xE8F1, 0xE3F4, 0xE8B8, 0xE8E5, 0xE8F1, 0xE3F4, 0xE3F4, 0xE873};
+			const std::string labels[] = {tr("渲染分辨率"), tr("显示模式"), tr("画面比例"), tr("整数倍数"), tr("自定义设置"),
+				tr("纹理过滤"), tr("各向异性过滤"), tr("纹理去色带"), tr("遮罩设置"), tr("着色器设置"),
+				tr("同步画面设置"), tr("同步着色器设置"), tr("同步遮罩设置")};
+			const int rowIcons[] = {0xE333, 0xE8F1, 0xE3F4, 0xE3F4, 0xE8B2, 0xE3F4, 0xE3F4, 0xE873, 0xE3F4, 0xE8B2, 0xE8D5, 0xE8D5, 0xE8D5};
 			auto enabled = [](bool value) { return value ? std::string(tr("开启")) : std::string(tr("关闭")); };
 			auto settingValue = [&](int index) {
 				switch (index) {
-				case 0: return g_Config.iInternalResolution == 0 ? std::string(tr("自动")) : std::to_string(g_Config.iInternalResolution) + "x";
+				case 0: return std::to_string(std::clamp(g_Config.iInternalResolution, 1, 5));
 				case 1: return TranslatedDisplayModeLabel(displaySettings_.mode);
-				case 2: return TranslatedDisplaySizeLabel(displaySettings_.size);
-				case 3: return g_Config.iFrameSkip == 0 ? std::string(tr("关闭")) : std::to_string(g_Config.iFrameSkip) + tr(" 帧");
-				case 4: return enabled(g_Config.bAutoFrameSkip);
-				case 5: return enabled(g_Config.bVSync);
-				case 6: {
+				case 2: return displaySettings_.size == DisplaySize::_4_3 ? std::string("4:3") : std::string("16:9");
+				case 3: return TranslatedDisplaySizeLabel(displaySettings_.size);
+				case 4: return std::string(">");
+				case 5: {
 					const std::string filters[] = {tr("默认"), tr("自动"), tr("最近邻"), tr("线性"), tr("高质量")};
 					return std::string(filters[std::clamp(g_Config.iTexFiltering, 0, 4)]);
 				}
-				case 7: return g_Config.iAnisotropyLevel == 0 ? std::string(tr("关闭")) : std::to_string(1 << g_Config.iAnisotropyLevel) + "x";
-				default: return enabled(g_Config.bTexDeposterize);
+				case 6: return g_Config.iAnisotropyLevel == 0 ? std::string(tr("关闭")) : std::to_string(1 << g_Config.iAnisotropyLevel) + "x";
+				case 7: return enabled(g_Config.bTexDeposterize);
+				case 8: return std::string(">");
+				case 9: return std::string(">");
+				default: return std::string(">");
 				}
 			};
-			const int total = 9;
-			const int visible = std::min(8, total);
-			const int first = std::clamp(selection_ - visible / 2, 0, std::max(0, total - visible));
-			for (int row = 0; row < visible; ++row) {
-				const int index = first + row;
+			const float positions[] = {0.55f, 1.55f, 2.55f, 3.55f, 4.55f, 6.55f, 7.55f, 8.55f, 10.55f, 11.55f, 13.55f, 14.55f, 15.55f};
+			const float scroll = std::clamp(positions[selection_] - 4.0f, 0.0f, 8.0f);
+			const char *headers[] = {"画面功能", "纹理功能", "美化功能", "同步设置"};
+			const float headerPositions[] = {0.0f, 6.0f, 10.0f, 13.0f};
+			for (int i = 0; i < 4; ++i)
+				drawSectionHeader(viewTop + (headerPositions[i] - scroll) * (rowH + rowGap), tr(headers[i]));
+			for (int index = 0; index < 13; ++index) {
 				EncodeUtf8(icon, rowIcons[index]);
-				drawRow(row, inContent && index == selection_, icon, labels[index],
-					settingValue(index), true);
+				const bool rowEnabled = !(((index == 2 || index == 3) && displaySettings_.mode == DisplayMode::Custom) ||
+					(index == 4 && displaySettings_.mode != DisplayMode::Custom));
+				const bool selector = index < 4 || (index >= 5 && index < 8);
+				drawRow(positions[index] - scroll, inContent && index == selection_, icon, labels[index],
+					settingValue(index), selector, rowEnabled);
 			}
 		}
 	} else {
@@ -1620,6 +1891,113 @@ void Overlay::DrawHelpers(ImDrawList *drawList, ImVec2 displaySize, float scale,
 	drawList->AddText(font, 19.0f * scale, ImVec2(1042.0f * scale, baseY - 19.0f * scale * 0.5f), hintColor, bLabel.c_str());
 	drawList->AddText(font, 27.0f * scale, ImVec2(1152.0f * scale, baseY - 27.0f * scale * 0.5f), hintColor, iconA);
 	drawList->AddText(font, 19.0f * scale, ImVec2(1174.0f * scale, baseY - 19.0f * scale * 0.5f), hintColor, aLabel.c_str());
+}
+
+void Overlay::DrawSettingsSidebar(ImDrawList *drawList, ImVec2 displaySize, float scale, float ease) {
+	if (settingsSidebar_ == SettingsSidebar::None) return;
+	ImFont *font = ImGui::GetFont();
+	const bool picker = settingsSidebar_ == SettingsSidebar::MaskPicker || settingsSidebar_ == SettingsSidebar::ShaderPicker;
+	const std::string title = settingsSidebar_ == SettingsSidebar::Mask || settingsSidebar_ == SettingsSidebar::MaskPicker ?
+		tr("遮罩设置") : settingsSidebar_ == SettingsSidebar::Custom ? tr("自定义设置") : tr("着色器设置");
+	// Flycast uses a true right-hand side panel; a picker temporarily takes
+	// over the complete menu surface so paths remain legible.
+	const float panelW = picker ? displaySize.x : 510.0f * scale;
+	const float panelH = displaySize.y;
+	const ImVec2 min(picker ? 0.0f : displaySize.x - panelW, 0.0f);
+	const ImVec2 max(min.x + panelW, min.y + panelH);
+	drawList->AddRectFilled(min, max, picker ? IM_COL32(8, 18, 29, 244) : IM_COL32(12, 26, 39, 128));
+	if (!picker)
+		drawList->AddRectFilled(min, ImVec2(min.x + 5.0f * scale, max.y), IM_COL32(0, 122, 204, 128));
+	drawList->AddText(font, 27.0f * scale, ImVec2(min.x + 34.0f * scale, 58.0f * scale),
+		IM_COL32(240, 247, 255, 255), title.c_str());
+	drawList->AddLine(ImVec2(min.x + 26.0f * scale, 104.0f * scale), ImVec2(max.x - 26.0f * scale, 104.0f * scale),
+		IM_COL32(112, 204, 255, 255), 1.0f * scale);
+	const float rowH = picker ? 62.0f * scale : 58.0f * scale;
+	auto row = [&](int visualIndex, int actualIndex, const std::string &label, const std::string &value, bool selector) {
+		const float y = (picker ? 126.0f : 132.0f) * scale + visualIndex * rowH;
+		// File pickers draw a scrolling window.  Focus must compare against the
+		// entry's actual index, not its row inside that window.
+		const bool focused = actualIndex == sidebarSelection_;
+		const ImVec2 a(min.x + (picker ? 62.0f : 24.0f) * scale, y), b(max.x - (picker ? 62.0f : 24.0f) * scale, y + rowH - 5.0f * scale);
+		drawList->AddRectFilled(a, b, focused ? IM_COL32(0, 77, 128, 128) : IM_COL32(255, 255, 255, 13), 4.0f * scale);
+		drawList->AddRect(a, b, IM_COL32(255, 255, 255, focused ? 82 : 42), 4.0f * scale);
+		if (focused) drawList->AddRect(a, b, IM_COL32(112, 204, 255, 255), 4.0f * scale, 0, 2.0f * scale);
+		drawList->AddText(font, 20.0f * scale, ImVec2(a.x + 18.0f * scale, y + 16.0f * scale), focused ? IM_COL32(240,247,255,255) : IM_COL32(184,204,224,220), label.c_str());
+		const float valueW = font->CalcTextSizeA(20.0f * scale, 10000.0f, 0.0f, value.c_str()).x;
+		if (selector) {
+			char left[8], right[8]; EncodeUtf8(left, 0xE0E4); EncodeUtf8(right, 0xE0E5);
+			drawList->AddText(font, 21.0f * scale, ImVec2(b.x - 150.0f * scale, y + 15.0f * scale), IM_COL32(112, 204, 255, 255), left);
+			drawList->AddText(font, 21.0f * scale, ImVec2(b.x - 38.0f * scale, y + 15.0f * scale), IM_COL32(112, 204, 255, 255), right);
+		}
+		drawList->AddText(font, 20.0f * scale, ImVec2(b.x - valueW - (selector ? 62.0f : 18.0f) * scale, y + 16.0f * scale), IM_COL32(112, 204, 255, 255), value.c_str());
+	};
+	if (picker) {
+		const std::string path = pickerDirectory_.empty() ? tr("无可用目录") : pickerDirectory_;
+		drawList->AddText(font, 17.0f * scale, ImVec2(min.x + 30.0f * scale, min.y + 72.0f * scale), IM_COL32(171, 211, 235, 255), path.c_str());
+		const int first = std::clamp(sidebarSelection_ - 4, 0, std::max(0, (int)pickerEntries_.size() - 8));
+		for (int i = 0; i < 8 && first + i < (int)pickerEntries_.size(); ++i) {
+			const PickerEntry &entry = pickerEntries_[first + i];
+			char entryIcon[8];
+			EncodeUtf8(entryIcon, entry.directory ? 0xE2C7 : 0xE24D);
+			row(i, first + i, std::string(entryIcon) + "  " + entry.label,
+				entry.directory ? ">" : "", false);
+		}
+	} else if (settingsSidebar_ == SettingsSidebar::Custom) {
+		row(0, 0, tr("缩放倍数"), StringFromFormat("%.2f", displaySettings_.customScale), true);
+		const int offsetX = (int)std::lround((displaySettings_.customOffsetX - 0.5f) * std::max(1, g_display.pixel_xres));
+		const int offsetY = (int)std::lround((displaySettings_.customOffsetY - 0.5f) * std::max(1, g_display.pixel_yres));
+		row(1, 1, tr("X坐标偏移"), StringFromFormat("%d px", offsetX), true);
+		row(2, 2, tr("Y坐标偏移"), StringFromFormat("%d px", offsetY), true);
+	} else if (settingsSidebar_ == SettingsSidebar::Mask) {
+		row(0, 0, tr("遮罩开关"), gameMaskEnabled_ ? tr("开") : tr("关"), false);
+		row(1, 1, tr("遮罩路径选择"), ">", false);
+	} else {
+		row(0, 0, tr("着色器开关"), g_Config.vPostShaderNames.empty() ? tr("关") : tr("开"), false);
+		row(1, 1, tr("着色器路径选择"), ">", false);
+	}
+	char b[8], a[8]; EncodeUtf8(b, 0xE0E1); EncodeUtf8(a, 0xE0E0);
+	const std::string footerBack = picker ? tr("返回") : tr("关闭");
+	const std::string footerConfirm = picker ? tr("选择") : tr("调整");
+	drawList->AddText(font, 24.0f * scale, ImVec2(min.x + 30.0f * scale, max.y - 43.0f * scale), IM_COL32(184, 204, 224, 255), b);
+	drawList->AddText(font, 17.0f * scale, ImVec2(min.x + 54.0f * scale, max.y - 40.0f * scale), IM_COL32(184, 204, 224, 255), footerBack.c_str());
+	drawList->AddText(font, 24.0f * scale, ImVec2(max.x - 170.0f * scale, max.y - 43.0f * scale), IM_COL32(112, 204, 255, 255), a);
+	drawList->AddText(font, 17.0f * scale, ImVec2(max.x - 144.0f * scale, max.y - 40.0f * scale), IM_COL32(112, 204, 255, 255), footerConfirm.c_str());
+}
+
+void Overlay::DrawSyncConfirmDialog(ImDrawList *drawList, ImVec2 displaySize, float scale, float ease) {
+	if (syncConfirm_ == SyncConfirm::None || !drawList) {
+		return;
+	}
+	const std::string kind = syncConfirm_ == SyncConfirm::Display ? tr("画面设置") :
+		syncConfirm_ == SyncConfirm::Mask ? tr("遮罩") : tr("Slang 着色器");
+	const std::string title = std::string(tr("同步 ")) + kind;
+	const std::string details = syncConfirm_ == SyncConfirm::Display
+		? tr("渲染分辨率、显示模式、画面比例、整数倍数和自定义设置")
+		: syncConfirm_ == SyncConfirm::Mask
+			? tr("遮罩开关和遮罩路径")
+			: tr("着色器开关、着色器路径和着色器参数");
+	const std::string message = tr("将同步以下设置到所有其他 PSP 游戏：\n") + details + tr("\n不会覆盖当前游戏。");
+	const float boxW = std::min(620.0f * scale, displaySize.x - 56.0f * scale);
+	const float boxH = 236.0f * scale;
+	const ImVec2 min((displaySize.x - boxW) * 0.5f, (displaySize.y - boxH) * 0.5f);
+	const ImVec2 max(min.x + boxW, min.y + boxH);
+	drawList->AddRectFilled(ImVec2(0, 0), displaySize, IM_COL32(0, 0, 0, (int)(152.0f * ease)));
+	drawList->AddRectFilled(min, max, IM_COL32(15, 31, 45, 248), 8.0f * scale);
+	drawList->AddRect(min, max, IM_COL32(102, 204, 255, 232), 8.0f * scale, 0, 2.0f * scale);
+	ImFont *font = ImGui::GetFont();
+	drawList->AddText(font, 27.0f * scale, ImVec2(min.x + 28.0f * scale, min.y + 28.0f * scale),
+		IM_COL32(240, 247, 255, 255), title.c_str());
+	drawList->AddText(font, 19.0f * scale, ImVec2(min.x + 28.0f * scale, min.y + 76.0f * scale),
+		IM_COL32(194, 218, 236, 255), message.c_str());
+	char iconB[8], iconA[8];
+	EncodeUtf8(iconB, 0xE0E1);
+	EncodeUtf8(iconA, 0xE0E0);
+	const float hintY = max.y - 38.0f * scale;
+	const float buttonX = max.x - 248.0f * scale;
+	drawList->AddText(font, 24.0f * scale, ImVec2(buttonX, hintY), IM_COL32(184, 204, 224, 255), iconB);
+	drawList->AddText(font, 17.0f * scale, ImVec2(buttonX + 24.0f * scale, hintY + 3.0f * scale), IM_COL32(184, 204, 224, 255), tr("取消").c_str());
+	drawList->AddText(font, 24.0f * scale, ImVec2(max.x - 118.0f * scale, hintY), IM_COL32(112, 204, 255, 255), iconA);
+	drawList->AddText(font, 17.0f * scale, ImVec2(max.x - 94.0f * scale, hintY + 3.0f * scale), IM_COL32(112, 204, 255, 255), tr("确认").c_str());
 }
 
 void Overlay::DrawRAAlerts(Draw::DrawContext *draw, ImDrawList *drawList, ImVec2 displaySize, float scale, float deltaTime) {
@@ -1788,9 +2166,16 @@ void Overlay::DrawUI(float width, float height, float deltaTime) {
 	const ImVec2 displaySize(width, height);
 	const float scale = std::max(1.0f, height / 720.0f);
 
-	DrawBackground(drawList, displaySize, ease);
-	DrawMenu(drawList, displaySize, scale, ease);
-	DrawHelpers(drawList, displaySize, scale, ease);
+	// Settings panels are pages, not modal overlays.  Keeping the regular menu
+	// underneath made both focus and the file picker visually ambiguous.
+	if (settingsSidebar_ != SettingsSidebar::None) {
+		DrawSettingsSidebar(drawList, displaySize, scale, ease);
+	} else {
+		DrawBackground(drawList, displaySize, ease);
+		DrawMenu(drawList, displaySize, scale, ease);
+		DrawHelpers(drawList, displaySize, scale, ease);
+	}
+	DrawSyncConfirmDialog(drawList, displaySize, scale, ease);
 }
 
 void Overlay::DrawHud(ImDrawList *drawList, float width, float height) {
@@ -1806,37 +2191,39 @@ void Overlay::DrawHud(ImDrawList *drawList, float width, float height) {
 		return;
 	}
 
-	// 3DS-style HUD: rounded translucent box top-left with green text.
-	const float em = std::max(14.0f, std::round(height / 32.0f));
+	// Compact independent badges keep FPS and fast-forward readable without
+	// covering as much of the game as the original combined panel.
+	// Slightly larger than the original compact badge: still unobtrusive, but
+	// readable at handheld distance and on a docked display.
+	const float em = std::max(8.0f, std::round(height / 54.0f));
 	const float margin = std::round(em * 0.6f);
 	const float pad = std::round(em * 0.35f);
 	const float fontScale = em / 21.0f;
-
-	std::string text;
-	if (showFps) {
-		char buf[24];
-		std::snprintf(buf, sizeof(buf), "FPS: %.1f", GetPspCurrentFps());
-		text = buf;
-	}
-	if (fastForward) {
-		if (!text.empty()) {
-			text += "   ";
-		}
-		char buf[16];
-		std::snprintf(buf, sizeof(buf), "%dx>>", static_cast<int>(GetPspFastForwardMultiplier()));
-		text += buf;
-	}
 
 	ImFont *font = ImGui::GetFont();
 	if (!font) {
 		return;
 	}
-	const ImVec2 textSize = font->CalcTextSizeA(font->FontSize * fontScale, FLT_MAX, 0.0f, text.c_str());
-	ImVec2 min(margin, margin);
-	ImVec2 max(margin + textSize.x + pad * 2.0f, margin + textSize.y + pad * 2.0f);
-	drawList->AddRectFilled(min, max, IM_COL32(0, 0, 0, 140), std::round(em * 0.25f));
-	drawList->AddText(font, font->FontSize * fontScale, ImVec2(min.x + pad, min.y + pad),
-		IM_COL32(135, 255, 135, 255), text.c_str());
+	float x = margin;
+	auto drawBadge = [&](const std::string &text, ImU32 color) {
+		const ImVec2 textSize = font->CalcTextSizeA(font->FontSize * fontScale, FLT_MAX, 0.0f, text.c_str());
+		const ImVec2 min(x, margin);
+		const ImVec2 max(x + textSize.x + pad * 2.0f, margin + textSize.y + pad * 2.0f);
+		drawList->AddRectFilled(min, max, IM_COL32(0, 0, 0, 158), std::round(em * 0.25f));
+		drawList->AddRect(min, max, color, std::round(em * 0.25f), 0, 1.0f);
+		drawList->AddText(font, font->FontSize * fontScale, ImVec2(min.x + pad, min.y + pad), color, text.c_str());
+		x = max.x + pad;
+	};
+	if (showFps) {
+		char buf[24];
+		std::snprintf(buf, sizeof(buf), "FPS: %.1f", GetPspCurrentFps());
+		drawBadge(buf, IM_COL32(104, 255, 145, 255));
+	}
+	if (fastForward) {
+		char buf[16];
+		std::snprintf(buf, sizeof(buf), "%dx >>", static_cast<int>(GetPspFastForwardMultiplier()));
+		drawBadge(buf, IM_COL32(100, 183, 255, 255));
+	}
 }
 
 void Overlay::Render(Draw::DrawContext *draw) {
@@ -1872,7 +2259,10 @@ void Overlay::Render(Draw::DrawContext *draw) {
 		LoadMaskTexture(draw);
 		if (maskTexture_) {
 			const ImTextureID maskId = ImGui_ImplThin3d_AddTextureTemp(maskTexture_);
-			ImGui::GetBackgroundDrawList()->AddImage(maskId, ImVec2(0, 0), ImVec2(width, height));
+			// The overlay is rendered after PPSSPP's game composite.  Put the
+			// mask in this final foreground sequence so it is always above the
+			// letterbox clear but below HUD and menu controls.
+			ImGui::GetForegroundDrawList()->AddImage(maskId, ImVec2(0, 0), ImVec2(width, height));
 		}
 	}
 	DrawHud(ImGui::GetForegroundDrawList(), width, height);

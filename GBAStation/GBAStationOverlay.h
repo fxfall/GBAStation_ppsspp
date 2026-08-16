@@ -72,17 +72,31 @@ public:
 	// Per-title display values come from the launcher GameDB.  Keep them in the
 	// overlay rather than reloading the global core config whenever the menu is
 	// opened, otherwise one game's aspect/scale leaks into the next game.
-	void SetGameDisplaySettings(int displayMode, const std::string &screenLayout, int internalResolution);
+	void SetGameDisplaySettings(int displayMode, const std::string &screenLayout, int internalResolution,
+		float customScale = 1.0f, float customOffsetX = 0.5f, float customOffsetY = 0.5f);
 	void SetGameMaskSettings(bool enabled, const std::string &path);
 	bool IsGameMaskEnabled() const { return gameMaskEnabled_; }
 	const std::string &GameMaskPath() const { return gameMaskPath_; }
+	// These requests are deliberately one-shot.  The runtime owns GameDB and
+	// applies a confirmed request to every *other* PSP entry.
+	bool ConsumeSyncDisplaySettingsRequest();
+	bool ConsumeSyncMaskSettingsRequest();
+	bool ConsumeSyncShaderSettingsRequest();
 	bool ConsumeGameDisplaySettingsSaveRequest() {
 		const bool requested = gameDisplaySettingsSaveRequested_;
 		gameDisplaySettingsSaveRequested_ = false;
 		return requested;
 	}
+	bool ConsumeGameShaderSettingsSaveRequest() {
+		const bool requested = gameShaderSettingsSaveRequested_;
+		gameShaderSettingsSaveRequested_ = false;
+		return requested;
+	}
 	int GameDisplayModeIndex() const { return static_cast<int>(displaySettings_.mode); }
 	const char *GameScreenLayout() const { return DisplaySizeLabel(displaySettings_.size); }
+	float GameCustomDisplayScale() const { return displaySettings_.customScale; }
+	float GameCustomDisplayOffsetX() const { return displaySettings_.customOffsetX; }
+	float GameCustomDisplayOffsetY() const { return displaySettings_.customOffsetY; }
 
 	bool IsReady() const { return ready_; }
 	bool IsVisible() const { return visible_; }
@@ -103,6 +117,25 @@ private:
 		Cheats,
 		Settings,
 	};
+	enum class SettingsSidebar {
+		None,
+		Mask,
+		Shader,
+		Custom,
+		MaskPicker,
+		ShaderPicker,
+	};
+	struct PickerEntry {
+		std::string label;
+		std::string path;
+		bool directory = false;
+	};
+	enum class SyncConfirm {
+		None,
+		Display,
+		Mask,
+		Shader,
+	};
 
 	int ItemCount() const;
 	int QuickMenuStorageIndex(int visibleIndex) const;
@@ -112,7 +145,12 @@ private:
 	void DrawMenu(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
 	void DrawHelpers(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
 	void DrawRAAlerts(Draw::DrawContext *draw, ::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float deltaTime);
+	void DrawSyncConfirmDialog(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
+	void DrawSettingsSidebar(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
 	void CycleSetting(int direction);
+	void OpenSettingsSidebar(SettingsSidebar sidebar);
+	void ReloadPickerEntries();
+	bool HandleSettingsSidebarInput(u64 buttons, u64 pressed, bool navUp, bool navDown, bool navLeft, bool navRight);
 	void ActivateTab(int tab);
 	void ApplyDisplaySettings(bool save);
 	Draw::Texture *LoadRAIconTexture(Draw::DrawContext *draw);
@@ -136,6 +174,18 @@ private:
 	bool coreSettingsPage_ = false;
 	bool coreSettingsChanged_ = false;
 	bool gameDisplaySettingsSaveRequested_ = false;
+	bool gameShaderSettingsSaveRequested_ = false;
+	bool syncDisplaySettingsRequested_ = false;
+	bool syncMaskSettingsRequested_ = false;
+	bool syncShaderSettingsRequested_ = false;
+	SyncConfirm syncConfirm_ = SyncConfirm::None;
+	SettingsSidebar settingsSidebar_ = SettingsSidebar::None;
+	int sidebarSelection_ = 0;
+	int sidebarAdjustDir_ = 0;
+	u64 sidebarAdjustStartMs_ = 0;
+	u64 sidebarAdjustNextMs_ = 0;
+	std::vector<PickerEntry> pickerEntries_;
+	std::string pickerDirectory_;
 	bool hasGameDisplaySettings_ = false;
 	Menu menu_ = Menu::Quick;
 	OverlayAction saveStateMode_ = OverlayAction::SaveState;
@@ -172,6 +222,10 @@ private:
 	Draw::Texture *raIconTexture_ = nullptr;
 	Draw::Texture *focusTexture_ = nullptr;
 	Draw::Texture *maskTexture_ = nullptr;
+	// A texture may still be referenced by a submitted ImGui draw list when a
+	// GameDB mask is changed.  Keep replaced textures alive until Shutdown
+	// rather than releasing an in-flight Thin3D resource.
+	std::vector<Draw::Texture *> retiredMaskTextures_;
 	bool gameMaskEnabled_ = false;
 	std::string gameMaskPath_;
 	ImGuiContext *context_ = nullptr;

@@ -8,6 +8,7 @@
 #include "GPU/Common/TextureScalerCommon.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 
 namespace GBAStation {
@@ -41,6 +42,7 @@ constexpr const char *kDefaultPpssppCoreConfig = R"json({
     "ppsspp_skip_buffer_effects": "disabled",
     "ppsspp_frameskip": "0",
     "ppsspp_auto_frameskip": "disabled",
+    "ppsspp_render_duplicate_frames": "disabled",
     "ppsspp_frame_duplication": "disabled",
     "ppsspp_detect_vsync_swap_interval": "disabled",
     "ppsspp_inflight_frames": "Up to 2",
@@ -83,6 +85,7 @@ void ApplyPpssppOptions(const std::map<std::string, std::string> &options) {
 	applyBool("ppsspp_software_rendering", g_Config.bSoftwareRendering);
 	applyBool("ppsspp_cropto16x9", g_Config.bDisplayCropTo16x9);
 	applyBool("ppsspp_auto_frameskip", g_Config.bAutoFrameSkip);
+	applyBool("ppsspp_render_duplicate_frames", g_Config.bRenderDuplicateFrames);
 	applyBool("ppsspp_vsync", g_Config.bVSync);
 	applyBool("ppsspp_frame_duplication", g_Config.bRenderDuplicateFrames);
 	applyBool("ppsspp_skip_buffer_effects", g_Config.bSkipBufferEffects);
@@ -227,7 +230,9 @@ void ApplyPpssppOptions(const std::map<std::string, std::string> &options) {
 }
 
 DisplayMode ParseDisplayMode(const std::string &value) {
-	return value == "Integer" ? DisplayMode::Integer : DisplayMode::Display;
+	if (value == "Integer") return DisplayMode::Integer;
+	if (value == "Custom") return DisplayMode::Custom;
+	return DisplayMode::Display;
 }
 
 DisplaySize ParseDisplaySize(const std::string &value, DisplayMode mode) {
@@ -255,6 +260,9 @@ DisplaySize NormalizeDisplaySize(DisplayMode mode, DisplaySize size) {
 		default:
 			return DisplaySize::Auto;
 		}
+	}
+	if (mode == DisplayMode::Custom) {
+		return size;
 	}
 
 	switch (size) {
@@ -284,12 +292,20 @@ DisplaySettings DisplaySettingsFromOptions(const std::map<std::string, std::stri
 	if (sizeValue) {
 		settings.size = ParseDisplaySize(*sizeValue, settings.mode);
 	}
+	if (const std::string *value = FindOption(options, "custom_display_scale")) settings.customScale = std::strtof(value->c_str(), nullptr);
+	if (const std::string *value = FindOption(options, "custom_display_offset_x")) settings.customOffsetX = std::strtof(value->c_str(), nullptr);
+	if (const std::string *value = FindOption(options, "custom_display_offset_y")) settings.customOffsetY = std::strtof(value->c_str(), nullptr);
+	settings.customScale = std::clamp(settings.customScale, 0.5f, 5.0f);
+	settings.customOffsetX = std::clamp(settings.customOffsetX, 0.0f, 1.0f);
+	settings.customOffsetY = std::clamp(settings.customOffsetY, 0.0f, 1.0f);
 	settings.size = NormalizeDisplaySize(settings.mode, settings.size);
 	return settings;
 }
 
 const char *DisplayModeConfigValue(DisplayMode mode) {
-	return mode == DisplayMode::Integer ? "Integer" : "Display";
+	if (mode == DisplayMode::Integer) return "Integer";
+	if (mode == DisplayMode::Custom) return "Custom";
+	return "Display";
 }
 
 const char *DisplaySizeConfigValue(DisplaySize size) {
@@ -411,6 +427,9 @@ void SavePpssppDisplaySettings(const DisplaySettings &settings, LogCallback log)
 	const DisplaySize normalizedSize = normalizedSettings.size;
 	config.SetValue("display_mode", DisplayModeConfigValue(normalizedSettings.mode));
 	config.SetValue("display_size", DisplaySizeConfigValue(normalizedSize));
+	config.SetValue("custom_display_scale", std::to_string(normalizedSettings.customScale));
+	config.SetValue("custom_display_offset_x", std::to_string(normalizedSettings.customOffsetX));
+	config.SetValue("custom_display_offset_y", std::to_string(normalizedSettings.customOffsetY));
 	if (normalizedSettings.mode == DisplayMode::Integer) {
 		config.SetValue("integer_scale", DisplaySizeConfigValue(normalizedSize));
 	} else if (config.GetValue("integer_scale").empty()) {
@@ -438,6 +457,13 @@ void ApplyPpssppDisplaySettings(const DisplaySettings &settings) {
 
 	layout.bDisplayStretch = false;
 	layout.bDisplayIntegerScale = false;
+	if (normalizedSettings.mode == DisplayMode::Custom) {
+		layout.fDisplayOffsetX = normalizedSettings.customOffsetX;
+		layout.fDisplayOffsetY = normalizedSettings.customOffsetY;
+		layout.fDisplayScale = normalizedSettings.customScale;
+		layout.fDisplayAspectRatio = 1.0f;
+		return;
+	}
 	layout.fDisplayOffsetX = 0.5f;
 	layout.fDisplayOffsetY = 0.5f;
 	layout.fDisplayScale = 1.0f;
@@ -475,7 +501,8 @@ int MaxPpssppIntegerScaleForCurrentDisplay() {
 }
 
 const char *DisplayModeLabel(DisplayMode mode) {
-	return mode == DisplayMode::Integer ? "Integer" : "Display";
+	if (mode == DisplayMode::Integer) return "Integer";
+	return mode == DisplayMode::Custom ? "Custom" : "Display";
 }
 
 const char *DisplaySizeLabel(DisplaySize size) {

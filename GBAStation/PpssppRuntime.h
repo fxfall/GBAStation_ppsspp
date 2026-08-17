@@ -12,8 +12,6 @@ namespace GBAStation {
 // user's global PPSSPP configuration.
 void PersistPspGameDbShaderSettings();
 void NotifyPspGpuConfigChanged();
-std::string GetPspCoreConfigValue(const char *option, const char *fallback);
-void SetPspCoreConfigValue(const char *option, const std::string &value);
 
 class PpssppRuntime final : public CoreRuntime {
 public:

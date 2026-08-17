@@ -2216,36 +2216,6 @@ bool GetPspShowFps() {
 	return true;
 }
 
-std::string GetPspCoreConfigValue(const char *option, const char *fallback) {
-	const std::string key = std::string("core.ppsspp.") + option;
-	const auto it = g_state.gbastationConfig.find(key);
-	return it == g_state.gbastationConfig.end() ? std::string(fallback) : it->second;
-}
-
-void SetPspCoreConfigValue(const char *option, const std::string &value) {
-	const std::string key = std::string("core.ppsspp.") + option;
-	g_state.gbastationConfig[key] = value;
-	WriteConfigValue(key.c_str(), value);
-	const bool enabled = value == "enabled" || value == "1" || value == "true";
-	if (!std::strcmp(option, "ppsspp_ignore_bad_memory_access")) g_Config.bIgnoreBadMemAccess = enabled;
-	else if (!std::strcmp(option, "ppsspp_force_lag_sync")) g_Config.bForceLagSync = enabled;
-	else if (!std::strcmp(option, "ppsspp_cheats")) g_Config.bEnableCheats = enabled;
-	else if (!std::strcmp(option, "ppsspp_memstick_inserted")) g_Config.bMemStickInserted = enabled;
-	else if (!std::strcmp(option, "ppsspp_cropto16x9")) g_Config.bDisplayCropTo16x9 = enabled;
-	else if (!std::strcmp(option, "ppsspp_disable_range_culling")) g_Config.bDisableRangeCulling = enabled;
-	else if (!std::strcmp(option, "ppsspp_software_skinning")) g_Config.bSoftwareSkinning = enabled;
-	else if (!std::strcmp(option, "ppsspp_hardware_tesselation")) g_Config.bHardwareTessellation = enabled;
-	else if (!std::strcmp(option, "ppsspp_smart_2d_texture_filtering")) g_Config.bSmart2DTexFiltering = enabled;
-	else if (!std::strcmp(option, "ppsspp_lazy_texture_caching")) g_Config.bTextureBackoffCache = enabled;
-	else if (!std::strcmp(option, "ppsspp_texture_replacement")) g_Config.bReplaceTextures = enabled;
-	else if (!std::strcmp(option, "ppsspp_analog_is_circular")) g_Config.bAnalogIsCircular = enabled;
-	else if (!std::strcmp(option, "ppsspp_analog_deadzone")) g_Config.fAnalogDeadzone = std::strtof(value.c_str(), nullptr);
-	else if (!std::strcmp(option, "ppsspp_analog_sensitivity")) g_Config.fAnalogSensitivity = std::strtof(value.c_str(), nullptr);
-	else if (!std::strcmp(option, "ppsspp_locked_cpu_speed")) g_Config.iLockedCPUSpeed = std::strtol(value.c_str(), nullptr, 10);
-	System_PostUIMessage(UIMessage::GPU_CONFIG_CHANGED);
-}
-
-
 PpssppRuntime::PpssppRuntime(LogCallback log) : log_(std::move(log)) {
 	g_state.log = log_;
 }

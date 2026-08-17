@@ -610,60 +610,6 @@ std::string BuiltinPostShaderLabel(const std::string &section) {
 	return std::string(tr("默认"));
 }
 
-struct CoreExtraOption {
-	const char *label;
-	const char *key;
-	const char *values;
-};
-
-// All values are launcher config.cfg values (core.ppsspp.<key>).  They are
-// deliberately separate from the settings already exposed above this list.
-constexpr CoreExtraOption kCoreExtraOptions[] = {
-	{"CPU 后端", "ppsspp_cpu_core", "JIT|IR JIT|Interpreter"},
-	{"忽略错误内存访问", "ppsspp_ignore_bad_memory_access", "enabled|disabled"},
-	{"I/O 时序", "ppsspp_io_timing_method", "Fast|Host|Simulate UMD delays|Simulate UMD slow reading speed"},
-	{"强制延迟同步", "ppsspp_force_lag_sync", "disabled|enabled"},
-	{"锁定 CPU 时钟", "ppsspp_locked_cpu_speed", "0|20|50|100|200|222|266|333"},
-	{"缓存 ISO", "ppsspp_cache_iso", "disabled|enabled"},
-	{"启用金手指", "ppsspp_cheats", "disabled|enabled"},
-	{"PSP 机型", "ppsspp_psp_model", "psp_1000|psp_2000_3000"},
-	{"确认键偏好", "ppsspp_button_preference", "Cross|Circle"},
-	{"软件渲染", "ppsspp_software_rendering", "disabled|enabled"},
-	{"降低特效分辨率", "ppsspp_lower_resolution_for_effects", "Off|Safe|Balanced|Aggressive"},
-	{"多重采样", "ppsspp_multisample_level", "Disabled|x2|x4|x8"},
-	{"在途帧数", "ppsspp_inflight_frames", "No buffer|Up to 1|Up to 2"},
-	{"纹理缩放算法", "ppsspp_texture_scaling_type", "xbrz|hybrid|bicubic|hybrid_bicubic"},
-	{"纹理缩放倍率", "ppsspp_texture_scaling_level", "disabled|2x|3x|4x|5x"},
-	{"纹理替换", "ppsspp_texture_replacement", "enabled|disabled"},
-	{"纹理缩放着色器", "ppsspp_texture_shader", "disabled|2xBRZ|4xBRZ|MMPX"},
-	{"智能 2D 纹理过滤", "ppsspp_smart_2d_texture_filtering", "disabled|enabled"},
-	{"延迟纹理缓存", "ppsspp_lazy_texture_caching", "disabled|enabled"},
-	{"圆形模拟摇杆", "ppsspp_analog_is_circular", "disabled|enabled"},
-	{"摇杆死区", "ppsspp_analog_deadzone", "0.00|0.10|0.15|0.20|0.25|0.30"},
-	{"摇杆灵敏度", "ppsspp_analog_sensitivity", "0.80|0.90|1.00|1.10|1.20|1.30"},
-	{"PSP 系统语言", "ppsspp_language", "Automatic|English|Japanese|French|Spanish|German|Italian|Korean|Chinese Traditional|Chinese Simplified"},
-	{"插入记忆棒", "ppsspp_memstick_inserted", "enabled|disabled"},
-	{"裁切至 16:9", "ppsspp_cropto16x9", "disabled|enabled"},
-	{"软件蒙皮", "ppsspp_software_skinning", "disabled|enabled"},
-	{"硬件曲面细分", "ppsspp_hardware_tesselation", "disabled|enabled"},
-	{"跳过 GPU 读取", "ppsspp_skip_gpu_readbacks", "disabled|enabled"},
-	{"曲线质量", "ppsspp_spline_quality", "Low|Medium|High"},
-	{"禁用范围剔除", "ppsspp_disable_range_culling", "disabled|enabled"},
-};
-
-std::vector<std::string> CoreExtraValues(const CoreExtraOption &option) {
-	std::vector<std::string> values;
-	SplitString(option.values, '|', values);
-	return values;
-}
-
-bool CoreExtraRequiresRestart(const char *key) {
-	return !std::strcmp(key, "ppsspp_cpu_core") || !std::strcmp(key, "ppsspp_io_timing_method") ||
-		!std::strcmp(key, "ppsspp_cache_iso") || !std::strcmp(key, "ppsspp_psp_model") ||
-		!std::strcmp(key, "ppsspp_software_rendering") || !std::strcmp(key, "ppsspp_multisample_level") ||
-		!std::strcmp(key, "ppsspp_inflight_frames") || !std::strcmp(key, "ppsspp_language");
-}
-
 bool Overlay::ConsumeSyncDisplaySettingsRequest() {
 	const bool requested = syncDisplaySettingsRequested_;
 	syncDisplaySettingsRequested_ = false;
@@ -1003,7 +949,7 @@ int Overlay::ItemCount() const {
 	if (menu_ == Menu::Cheats) {
 		return std::max(1, (int)cheats_.size());
 	}
-	return coreSettingsPage_ ? 9 + (int)ARRAY_SIZE(kCoreExtraOptions) : 13;
+	return coreSettingsPage_ ? 9 : 13;
 }
 
 void Overlay::ApplyDisplaySettings(bool save) {
@@ -1020,18 +966,6 @@ void Overlay::CycleSetting(int direction) {
 	}
 
 	if (coreSettingsPage_) {
-		if (settingsSelection_ >= 9) {
-			const CoreExtraOption &option = kCoreExtraOptions[settingsSelection_ - 9];
-			const std::vector<std::string> values = CoreExtraValues(option);
-			const std::string current = GetPspCoreConfigValue(option.key, values.front().c_str());
-			int index = 0;
-			for (int i = 0; i < (int)values.size(); ++i) {
-				if (values[i] == current) { index = i; break; }
-			}
-			index = (index + direction + (int)values.size()) % (int)values.size();
-			SetPspCoreConfigValue(option.key, values[index]);
-			return;
-		}
 		// 功能设置: 速度相关 + 调试相关。
 		switch (settingsSelection_) {
 		case 0: {
@@ -1969,23 +1903,6 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 	} else if (menu_ == Menu::Settings) {
 		char icon[8];
 	if (coreSettingsPage_) {
-		if (selection_ >= 9) {
-			const int extraSelection = selection_ - 9;
-			const float scroll = std::clamp((float)extraSelection - 4.0f, 0.0f,
-				std::max(0.0f, (float)ARRAY_SIZE(kCoreExtraOptions) - 8.0f));
-			drawSectionHeader(viewTop, tr("高级核心设置"));
-			for (int i = 0; i < (int)ARRAY_SIZE(kCoreExtraOptions); ++i) {
-				const CoreExtraOption &option = kCoreExtraOptions[i];
-				const std::vector<std::string> values = CoreExtraValues(option);
-				std::string value = GetPspCoreConfigValue(option.key, values.front().c_str());
-				if (CoreExtraRequiresRestart(option.key))
-					value += "  " + tr("重启生效");
-				EncodeUtf8(icon, 0xE8B2);
-				drawRow((float)i + 0.55f - scroll, inContent && i == extraSelection, icon,
-					tr(option.label), value, true, true);
-			}
-			return;
-		}
 		const std::string labels[] = {tr("快进倍率"), tr("快进触发模式"), tr("跳帧"), tr("自动跳帧"),
 				tr("跳过缓冲区效果"), tr("渲染重复帧至 60Hz"), tr("垂直同步"), tr("快速内存"), tr("硬件变换")};
 			const int rowIcons[] = {0xE8B2, 0xE8B8, 0xE8B8, 0xE8E5, 0xE428, 0xE8F1, 0xE8F1, 0xE896, 0xE3B6};

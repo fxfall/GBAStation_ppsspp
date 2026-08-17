@@ -565,29 +565,6 @@ void Overlay::ReleaseFocusTexture() {
 	}
 }
 
-void Overlay::LoadMaskTexture(Draw::DrawContext *draw) {
-	if (maskTexture_ || !draw || gameMaskPath_.empty()) {
-		return;
-	}
-	std::vector<unsigned char> imageData;
-	if (!ReadFileBytes(gameMaskPath_.c_str(), &imageData)) {
-		LogMessage(log_, "GBAStation overlay mask not found path=%s", gameMaskPath_.c_str());
-		return;
-	}
-	maskTexture_ = CreateTextureFromFileData(draw, imageData.data(), imageData.size(),
-		ImageFileType::PNG, false, gameMaskPath_.c_str());
-	if (!maskTexture_) {
-		LogMessage(log_, "GBAStation overlay mask decode failed path=%s", gameMaskPath_.c_str());
-	}
-}
-
-void Overlay::ReleaseMaskTexture() {
-	if (maskTexture_) {
-		maskTexture_->Release();
-		maskTexture_ = nullptr;
-	}
-}
-
 std::vector<const ShaderInfo *> BuiltinPostShaderOptions() {
 	std::vector<const ShaderInfo *> options;
 	for (const ShaderInfo &info : GetAllPostShaderInfo()) {
@@ -613,12 +590,6 @@ std::string BuiltinPostShaderLabel(const std::string &section) {
 bool Overlay::ConsumeSyncDisplaySettingsRequest() {
 	const bool requested = syncDisplaySettingsRequested_;
 	syncDisplaySettingsRequested_ = false;
-	return requested;
-}
-
-bool Overlay::ConsumeSyncMaskSettingsRequest() {
-	const bool requested = syncMaskSettingsRequested_;
-	syncMaskSettingsRequested_ = false;
 	return requested;
 }
 
@@ -685,11 +656,6 @@ void Overlay::Shutdown() {
 	}
 	ReleaseRAIconTexture();
 	ReleaseFocusTexture();
-	ReleaseMaskTexture();
-	for (Draw::Texture *texture : retiredMaskTextures_) {
-		texture->Release();
-	}
-	retiredMaskTextures_.clear();
 	for (SlotThumb &thumb : slotThumbs_) {
 		if (thumb.tex) {
 			thumb.tex->Release();
@@ -725,13 +691,11 @@ void Overlay::Shutdown() {
 	cheatsLoadingDelayFrames_ = 0;
 	cheats_.clear();
 	syncDisplaySettingsRequested_ = false;
-	syncMaskSettingsRequested_ = false;
 	syncShaderSettingsRequested_ = false;
 	syncConfirm_ = SyncConfirm::None;
 	settingsSidebar_ = SettingsSidebar::None;
 	sidebarSelection_ = 0;
 	pickerEntries_.clear();
-	pickerDirectory_.clear();
 	lastAnalogNavMs_ = 0;
 	selectorAdjustDir_ = 0;
 	selectorAdjustStartMs_ = 0;
@@ -861,19 +825,6 @@ void Overlay::SetGameDisplaySettings(int displayMode, const std::string &screenL
 	ApplyPpssppDisplaySettings(displaySettings_);
 }
 
-void Overlay::SetGameMaskSettings(bool enabled, const std::string &path) {
-	gameMaskEnabled_ = enabled;
-	if (gameMaskPath_ == path) {
-		return;
-	}
-	gameMaskPath_ = path;
-	if (maskTexture_) {
-		retiredMaskTextures_.push_back(maskTexture_);
-		maskTexture_ = nullptr;
-	}
-	LoadMaskTexture(draw_);
-}
-
 void Overlay::SetGameShaderSettings(bool enabled, const std::string &section) {
 	gameShaderEnabled_ = enabled;
 	if (!section.empty())
@@ -949,7 +900,7 @@ int Overlay::ItemCount() const {
 	if (menu_ == Menu::Cheats) {
 		return std::max(1, (int)cheats_.size());
 	}
-	return coreSettingsPage_ ? 9 : 13;
+	return coreSettingsPage_ ? 9 : 11;
 }
 
 void Overlay::ApplyDisplaySettings(bool save) {
@@ -1055,11 +1006,7 @@ void Overlay::OpenSettingsSidebar(SettingsSidebar sidebar) {
 	sidebarAdjustDir_ = 0;
 	sidebarAdjustStartMs_ = 0;
 	sidebarAdjustNextMs_ = 0;
-	if (sidebar == SettingsSidebar::MaskPicker) {
-		pickerDirectory_ = gameMaskPath_.empty() ? Path(kPpssppDataRoot).ToString() : Path(gameMaskPath_).GetDirectory();
-		ReloadPickerEntries();
-	} else if (sidebar == SettingsSidebar::ShaderPicker) {
-		pickerDirectory_ = tr("内置滤镜");
+	if (sidebar == SettingsSidebar::ShaderPicker) {
 		ReloadPickerEntries();
 	} else if (sidebar == SettingsSidebar::Shader) {
 		// Built-in post shaders are registered lazily in this standalone host.
@@ -1082,38 +1029,16 @@ void Overlay::ReloadPickerEntries() {
 	pickerEntries_.clear();
 	if (settingsSidebar_ == SettingsSidebar::ShaderPicker) {
 		for (const ShaderInfo *shader : BuiltinPostShaderOptions())
-			pickerEntries_.push_back({shader->name, shader->section, false});
+			pickerEntries_.push_back({shader->name, shader->section});
 		std::sort(pickerEntries_.begin(), pickerEntries_.end(), [](const PickerEntry &a, const PickerEntry &b) {
 			return a.label < b.label;
 		});
 		return;
 	}
-	if (pickerDirectory_.empty()) return;
-	const Path directory(pickerDirectory_);
-	if (directory.CanNavigateUp()) {
-		pickerEntries_.push_back({"..", directory.NavigateUp().ToString(), true});
-	}
-	std::vector<File::FileInfo> files;
-	if (!File::GetFilesInDir(directory, &files)) return;
-	const bool shaderPicker = settingsSidebar_ == SettingsSidebar::ShaderPicker;
-	for (const File::FileInfo &file : files) {
-		if (file.isDirectory) {
-			pickerEntries_.push_back({file.name + "/", file.fullName.ToString(), true});
-			continue;
-		}
-		const std::string extension = Path(file.name).GetFileExtension();
-		if ((shaderPicker && extension == ".slangp") || (!shaderPicker && extension == ".png"))
-			pickerEntries_.push_back({file.name, file.fullName.ToString(), false});
-	}
-	std::sort(pickerEntries_.begin() + (pickerEntries_.empty() ? 0 : (pickerEntries_[0].label == ".." ? 1 : 0)),
-		pickerEntries_.end(), [](const PickerEntry &a, const PickerEntry &b) {
-			if (a.directory != b.directory) return a.directory;
-			return a.label < b.label;
-		});
 }
 
 bool Overlay::HandleSettingsSidebarInput(u64 buttons, u64 pressed, bool navUp, bool navDown, bool navLeft, bool navRight) {
-	const bool picker = settingsSidebar_ == SettingsSidebar::MaskPicker || settingsSidebar_ == SettingsSidebar::ShaderPicker;
+	const bool picker = settingsSidebar_ == SettingsSidebar::ShaderPicker;
 	const int count = picker ? (int)pickerEntries_.size() : (settingsSidebar_ == SettingsSidebar::Custom ? 3 : 2);
 	if (count > 0) {
 		if (navUp) sidebarSelection_ = (sidebarSelection_ + count - 1) % count;
@@ -1159,70 +1084,54 @@ bool Overlay::HandleSettingsSidebarInput(u64 buttons, u64 pressed, bool navUp, b
 		}
 	} else if (!picker && (pressed & HidNpadButton_A)) {
 		if (sidebarSelection_ == 0) {
-			if (settingsSidebar_ == SettingsSidebar::Mask) {
-				gameMaskEnabled_ = !gameMaskEnabled_;
-				gameDisplaySettingsSaveRequested_ = true;
-			} else {
-				if (gameShaderEnabled_) {
-					for (const std::string &name : g_Config.vPostShaderNames) {
-						const ShaderInfo *info = GetPostShaderInfo(name);
-						if (info && !info->isSlang && info->section != "Off") {
-							gameShaderSection_ = info->section;
-							break;
-						}
-					}
-					g_Config.vPostShaderNames.clear();
-					gameShaderEnabled_ = false;
-				} else {
-					gameShaderEnabled_ = true;
-					if (!gameShaderSection_.empty()) {
-						const ShaderInfo *info = GetPostShaderInfo(gameShaderSection_);
-						if (info && !info->isSlang && info->section != "Off") {
-							g_Config.vPostShaderNames.assign(1, info->section);
-							FixPostShaderOrder(&g_Config.vPostShaderNames);
-						}
+			if (gameShaderEnabled_) {
+				for (const std::string &name : g_Config.vPostShaderNames) {
+					const ShaderInfo *info = GetPostShaderInfo(name);
+					if (info && !info->isSlang && info->section != "Off") {
+						gameShaderSection_ = info->section;
+						break;
 					}
 				}
-				gameShaderSettingsSaveRequested_ = true;
-				LogMessage(log_, "GBAStation built-in post shader toggle enabled=%d section=%s chain=%u",
-					gameShaderEnabled_ ? 1 : 0, gameShaderSection_.empty() ? "<none>" : gameShaderSection_.c_str(),
-					(unsigned)g_Config.vPostShaderNames.size());
-				System_PostUIMessage(UIMessage::GPU_CONFIG_CHANGED);
+				g_Config.vPostShaderNames.clear();
+				gameShaderEnabled_ = false;
+			} else {
+				gameShaderEnabled_ = true;
+				if (!gameShaderSection_.empty()) {
+					const ShaderInfo *info = GetPostShaderInfo(gameShaderSection_);
+					if (info && !info->isSlang && info->section != "Off") {
+						g_Config.vPostShaderNames.assign(1, info->section);
+						FixPostShaderOrder(&g_Config.vPostShaderNames);
+					}
+				}
 			}
+			gameShaderSettingsSaveRequested_ = true;
+			LogMessage(log_, "GBAStation built-in post shader toggle enabled=%d section=%s chain=%u",
+				gameShaderEnabled_ ? 1 : 0, gameShaderSection_.empty() ? "<none>" : gameShaderSection_.c_str(),
+				(unsigned)g_Config.vPostShaderNames.size());
+			System_PostUIMessage(UIMessage::GPU_CONFIG_CHANGED);
 		} else if (sidebarSelection_ == 1) {
-			OpenSettingsSidebar(settingsSidebar_ == SettingsSidebar::Mask ? SettingsSidebar::MaskPicker : SettingsSidebar::ShaderPicker);
+			OpenSettingsSidebar(SettingsSidebar::ShaderPicker);
 			return true;
 		}
 	}
 	if (picker && (pressed & HidNpadButton_A) && sidebarSelection_ >= 0 && sidebarSelection_ < (int)pickerEntries_.size()) {
 		const PickerEntry &entry = pickerEntries_[sidebarSelection_];
-		if (entry.directory) {
-			pickerDirectory_ = entry.path;
-			ReloadPickerEntries();
-			sidebarSelection_ = 0;
-		} else if (settingsSidebar_ == SettingsSidebar::MaskPicker) {
-			SetGameMaskSettings(true, entry.path);
-			gameDisplaySettingsSaveRequested_ = true;
-			OpenSettingsSidebar(SettingsSidebar::Mask);
-		} else {
-			const ShaderInfo *shader = GetPostShaderInfo(entry.path);
-			if (shader && !shader->isSlang && shader->section != "Off") {
-				g_Config.vPostShaderNames.assign(1, shader->section);
-				FixPostShaderOrder(&g_Config.vPostShaderNames);
-				gameShaderSection_ = shader->section;
-				gameShaderEnabled_ = true;
-				gameShaderSettingsSaveRequested_ = true;
-				System_PostUIMessage(UIMessage::GPU_CONFIG_CHANGED);
-				LogMessage(log_, "GBAStation built-in post shader selected name=%s section=%s",
-					shader->name.c_str(), shader->section.c_str());
-			}
-			OpenSettingsSidebar(SettingsSidebar::Shader);
+		const ShaderInfo *shader = GetPostShaderInfo(entry.path);
+		if (shader && !shader->isSlang && shader->section != "Off") {
+			g_Config.vPostShaderNames.assign(1, shader->section);
+			FixPostShaderOrder(&g_Config.vPostShaderNames);
+			gameShaderSection_ = shader->section;
+			gameShaderEnabled_ = true;
+			gameShaderSettingsSaveRequested_ = true;
+			System_PostUIMessage(UIMessage::GPU_CONFIG_CHANGED);
+			LogMessage(log_, "GBAStation built-in post shader selected name=%s section=%s",
+				shader->name.c_str(), shader->section.c_str());
 		}
+		OpenSettingsSidebar(SettingsSidebar::Shader);
 		return true;
 	}
 	if (pressed & HidNpadButton_B) {
-		if (settingsSidebar_ == SettingsSidebar::MaskPicker) OpenSettingsSidebar(SettingsSidebar::Mask);
-		else if (settingsSidebar_ == SettingsSidebar::ShaderPicker) OpenSettingsSidebar(SettingsSidebar::Shader);
+		if (settingsSidebar_ == SettingsSidebar::ShaderPicker) OpenSettingsSidebar(SettingsSidebar::Shader);
 		else settingsSidebar_ = SettingsSidebar::None;
 		sidebarAdjustDir_ = 0;
 		sidebarAdjustStartMs_ = 0;
@@ -1243,11 +1152,9 @@ void Overlay::ExecuteSelection() {
 			case 4:
 				if (displaySettings_.mode == DisplayMode::Custom) OpenSettingsSidebar(SettingsSidebar::Custom);
 				return;
-			case 8: OpenSettingsSidebar(SettingsSidebar::Mask); return;
-			case 9: OpenSettingsSidebar(SettingsSidebar::Shader); return;
-			case 10: syncConfirm_ = SyncConfirm::Display; return;
-			case 11: syncConfirm_ = SyncConfirm::Shader; return;
-			case 12: syncConfirm_ = SyncConfirm::Mask; return;
+			case 8: OpenSettingsSidebar(SettingsSidebar::Shader); return;
+			case 9: syncConfirm_ = SyncConfirm::Display; return;
+			case 10: syncConfirm_ = SyncConfirm::Shader; return;
 			default: break;
 			}
 		}
@@ -1324,7 +1231,6 @@ bool Overlay::HandleInput(u64 buttons, u64 pressed, int leftStickX, int leftStic
 			if (pressed & HidNpadButton_A) {
 				switch (syncConfirm_) {
 				case SyncConfirm::Display: syncDisplaySettingsRequested_ = true; break;
-				case SyncConfirm::Mask: syncMaskSettingsRequested_ = true; break;
 				case SyncConfirm::Shader: syncShaderSettingsRequested_ = true; break;
 				default: break;
 				}
@@ -1940,9 +1846,9 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 			}
 		} else {
 			const std::string labels[] = {tr("渲染分辨率"), tr("显示模式"), tr("画面比例"), tr("整数倍数"), tr("自定义设置"),
-				tr("纹理过滤"), tr("各向异性过滤"), tr("纹理去色带"), tr("遮罩设置"), tr("着色器设置"),
-				tr("同步画面设置"), tr("同步着色器设置"), tr("同步遮罩设置")};
-			const int rowIcons[] = {0xE333, 0xE8F1, 0xE3F4, 0xE3F4, 0xE8B2, 0xE3F4, 0xE3F4, 0xE873, 0xE3F4, 0xE8B2, 0xE8D5, 0xE8D5, 0xE8D5};
+				tr("纹理过滤"), tr("各向异性过滤"), tr("纹理去色带"), tr("着色器设置"),
+				tr("同步画面设置"), tr("同步着色器设置")};
+			const int rowIcons[] = {0xE333, 0xE8F1, 0xE3F4, 0xE3F4, 0xE8B2, 0xE3F4, 0xE3F4, 0xE873, 0xE8B2, 0xE8D5, 0xE8D5};
 			auto enabled = [](bool value) { return value ? std::string(tr("开启")) : std::string(tr("关闭")); };
 			auto settingValue = [&](int index) {
 				switch (index) {
@@ -1964,13 +1870,13 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 				default: return std::string(">");
 				}
 			};
-			const float positions[] = {0.55f, 1.55f, 2.55f, 3.55f, 4.55f, 6.55f, 7.55f, 8.55f, 10.55f, 11.55f, 13.55f, 14.55f, 15.55f};
-			const float scroll = std::clamp(positions[selection_] - 4.0f, 0.0f, 8.0f);
+			const float positions[] = {0.55f, 1.55f, 2.55f, 3.55f, 4.55f, 6.55f, 7.55f, 8.55f, 10.55f, 13.55f, 14.55f};
+			const float scroll = std::clamp(positions[selection_] - 4.0f, 0.0f, 7.0f);
 			const char *headers[] = {"画面功能", "纹理功能", "美化功能", "同步设置"};
 			const float headerPositions[] = {0.0f, 6.0f, 10.0f, 13.0f};
 			for (int i = 0; i < 4; ++i)
 				drawSectionHeader(viewTop + (headerPositions[i] - scroll) * (rowH + rowGap), tr(headers[i]));
-			for (int index = 0; index < 13; ++index) {
+			for (int index = 0; index < 11; ++index) {
 				EncodeUtf8(icon, rowIcons[index]);
 				const bool rowEnabled = !((index == 2 && displaySettings_.mode != DisplayMode::Display) ||
 					(index == 3 && displaySettings_.mode != DisplayMode::Integer) ||
@@ -2015,9 +1921,8 @@ void Overlay::DrawHelpers(ImDrawList *drawList, ImVec2 displaySize, float scale,
 void Overlay::DrawSettingsSidebar(ImDrawList *drawList, ImVec2 displaySize, float scale, float ease) {
 	if (settingsSidebar_ == SettingsSidebar::None) return;
 	ImFont *font = ImGui::GetFont();
-	const bool picker = settingsSidebar_ == SettingsSidebar::MaskPicker || settingsSidebar_ == SettingsSidebar::ShaderPicker;
-	const std::string title = settingsSidebar_ == SettingsSidebar::Mask || settingsSidebar_ == SettingsSidebar::MaskPicker ?
-		tr("遮罩设置") : settingsSidebar_ == SettingsSidebar::Custom ? tr("自定义设置") : tr("着色器设置");
+	const bool picker = settingsSidebar_ == SettingsSidebar::ShaderPicker;
+	const std::string title = settingsSidebar_ == SettingsSidebar::Custom ? tr("自定义设置") : tr("着色器设置");
 	// Flycast uses a true right-hand side panel; a picker temporarily takes
 	// over the complete menu surface so paths remain legible.
 	const float panelW = picker ? displaySize.x : 510.0f * scale;
@@ -2051,20 +1956,10 @@ void Overlay::DrawSettingsSidebar(ImDrawList *drawList, ImVec2 displaySize, floa
 		drawList->AddText(font, 20.0f * scale, ImVec2(b.x - valueW - (selector ? 62.0f : 18.0f) * scale, y + 16.0f * scale), IM_COL32(112, 204, 255, 255), value.c_str());
 	};
 	if (picker) {
-		const bool shaderList = settingsSidebar_ == SettingsSidebar::ShaderPicker;
-		const std::string path = pickerDirectory_.empty() ? tr("无可用目录") : pickerDirectory_;
-		drawList->AddText(font, 17.0f * scale, ImVec2(min.x + 30.0f * scale, min.y + 72.0f * scale), IM_COL32(171, 211, 235, 255), path.c_str());
 		const int first = std::clamp(sidebarSelection_ - 4, 0, std::max(0, (int)pickerEntries_.size() - 8));
 		for (int i = 0; i < 8 && first + i < (int)pickerEntries_.size(); ++i) {
 			const PickerEntry &entry = pickerEntries_[first + i];
-			if (shaderList) {
-				row(i, first + i, entry.label, entry.path == gameShaderSection_ ? tr("已选择") : "", false);
-			} else {
-				char entryIcon[8];
-				EncodeUtf8(entryIcon, entry.directory ? 0xE2C7 : 0xE24D);
-				row(i, first + i, std::string(entryIcon) + "  " + entry.label,
-					entry.directory ? ">" : "", false);
-			}
+			row(i, first + i, entry.label, entry.path == gameShaderSection_ ? tr("已选择") : "", false);
 		}
 	} else if (settingsSidebar_ == SettingsSidebar::Custom) {
 		row(0, 0, tr("缩放倍数"), StringFromFormat("%.2f", displaySettings_.customScale), true);
@@ -2072,9 +1967,6 @@ void Overlay::DrawSettingsSidebar(ImDrawList *drawList, ImVec2 displaySize, floa
 		const int offsetY = (int)std::lround((displaySettings_.customOffsetY - 0.5f) * std::max(1, g_display.pixel_yres));
 		row(1, 1, tr("X坐标偏移"), StringFromFormat("%d px", offsetX), true);
 		row(2, 2, tr("Y坐标偏移"), StringFromFormat("%d px", offsetY), true);
-	} else if (settingsSidebar_ == SettingsSidebar::Mask) {
-		row(0, 0, tr("遮罩开关"), gameMaskEnabled_ ? tr("开") : tr("关"), false);
-		row(1, 1, tr("遮罩路径选择"), ">", false);
 	} else {
 		row(0, 0, tr("着色器开关"), gameShaderEnabled_ ? tr("开") : tr("关"), false);
 		row(1, 1, tr("着色器选择"), BuiltinPostShaderLabel(gameShaderSection_), false);
@@ -2092,14 +1984,11 @@ void Overlay::DrawSyncConfirmDialog(ImDrawList *drawList, ImVec2 displaySize, fl
 	if (syncConfirm_ == SyncConfirm::None || !drawList) {
 		return;
 	}
-	const std::string kind = syncConfirm_ == SyncConfirm::Display ? tr("画面设置") :
-		syncConfirm_ == SyncConfirm::Mask ? tr("遮罩") : tr("内置滤镜");
+	const std::string kind = syncConfirm_ == SyncConfirm::Display ? tr("画面设置") : tr("内置滤镜");
 	const std::string title = std::string(tr("同步 ")) + kind;
 	const std::string details = syncConfirm_ == SyncConfirm::Display
 		? tr("渲染分辨率、显示模式、画面比例、整数倍数和自定义设置")
-		: syncConfirm_ == SyncConfirm::Mask
-			? tr("遮罩开关和遮罩路径")
-			: tr("着色器开关、内置滤镜和滤镜参数");
+		: tr("着色器开关、内置滤镜和滤镜参数");
 	const std::string message = tr("将同步以下设置到所有其他 PSP 游戏：\n") + details + tr("\n不会覆盖当前游戏。");
 	const float boxW = std::min(620.0f * scale, displaySize.x - 56.0f * scale);
 	const float boxH = 236.0f * scale;
@@ -2381,8 +2270,7 @@ void Overlay::Render(Draw::DrawContext *draw) {
 
 	const bool hasRAAlerts = !RetroAchievements().Notifications().empty();
 	const bool showHud = GetPspShowFps() || GetPspFastForwardActive();
-	const bool showMask = gameMaskEnabled_ && !gameMaskPath_.empty();
-	if (!visible_ && !hasRAAlerts && !showHud && !showMask) {
+	if (!visible_ && !hasRAAlerts && !showHud) {
 		return;
 	}
 
@@ -2403,16 +2291,6 @@ void Overlay::Render(Draw::DrawContext *draw) {
 
 	ImGui_ImplThin3d_NewFrame(draw, ComputeOrthoMatrix(orthoW, orthoH, draw->GetDeviceCaps().coordConvention));
 	ImGui::NewFrame();
-	if (showMask) {
-		LoadMaskTexture(draw);
-		if (maskTexture_) {
-			const ImTextureID maskId = ImGui_ImplThin3d_AddTextureTemp(maskTexture_);
-			// The overlay is rendered after PPSSPP's game composite.  Put the
-			// mask in this final foreground sequence so it is always above the
-			// letterbox clear but below HUD and menu controls.
-			ImGui::GetForegroundDrawList()->AddImage(maskId, ImVec2(0, 0), ImVec2(width, height));
-		}
-	}
 	DrawHud(ImGui::GetForegroundDrawList(), width, height);
 	if (visible_) {
 		DrawUI(width, height, io.DeltaTime);

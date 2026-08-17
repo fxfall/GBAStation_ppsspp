@@ -74,16 +74,12 @@ public:
 	// opened, otherwise one game's aspect/scale leaks into the next game.
 	void SetGameDisplaySettings(int displayMode, const std::string &screenLayout, int internalResolution,
 		float customScale = 1.0f, float customOffsetX = 0.5f, float customOffsetY = 0.5f);
-	void SetGameMaskSettings(bool enabled, const std::string &path);
-	bool IsGameMaskEnabled() const { return gameMaskEnabled_; }
-	const std::string &GameMaskPath() const { return gameMaskPath_; }
 	void SetGameShaderSettings(bool enabled, const std::string &section);
 	bool IsGameShaderEnabled() const { return gameShaderEnabled_; }
 	const std::string &GameShaderSection() const { return gameShaderSection_; }
 	// These requests are deliberately one-shot.  The runtime owns GameDB and
 	// applies a confirmed request to every *other* PSP entry.
 	bool ConsumeSyncDisplaySettingsRequest();
-	bool ConsumeSyncMaskSettingsRequest();
 	bool ConsumeSyncShaderSettingsRequest();
 	bool ConsumeGameDisplaySettingsSaveRequest() {
 		const bool requested = gameDisplaySettingsSaveRequested_;
@@ -125,21 +121,17 @@ private:
 	};
 	enum class SettingsSidebar {
 		None,
-		Mask,
 		Shader,
 		Custom,
-		MaskPicker,
 		ShaderPicker,
 	};
 	struct PickerEntry {
 		std::string label;
 		std::string path;
-		bool directory = false;
 	};
 	enum class SyncConfirm {
 		None,
 		Display,
-		Mask,
 		Shader,
 	};
 
@@ -164,8 +156,6 @@ private:
 	void ReleaseRAIconTexture();
 	void LoadFocusTexture(Draw::DrawContext *draw);
 	void ReleaseFocusTexture();
-	void LoadMaskTexture(Draw::DrawContext *draw);
-	void ReleaseMaskTexture();
 	void DrawFlowBorder(::ImDrawList *drawList, float x, float y, float w, float h, float thickness);
 	void ExecuteSelection();
 
@@ -185,7 +175,6 @@ private:
 	bool gameDisplaySettingsSaveRequested_ = false;
 	bool gameShaderSettingsSaveRequested_ = false;
 	bool syncDisplaySettingsRequested_ = false;
-	bool syncMaskSettingsRequested_ = false;
 	bool syncShaderSettingsRequested_ = false;
 	SyncConfirm syncConfirm_ = SyncConfirm::None;
 	SettingsSidebar settingsSidebar_ = SettingsSidebar::None;
@@ -194,7 +183,6 @@ private:
 	u64 sidebarAdjustStartMs_ = 0;
 	u64 sidebarAdjustNextMs_ = 0;
 	std::vector<PickerEntry> pickerEntries_;
-	std::string pickerDirectory_;
 	bool hasGameDisplaySettings_ = false;
 	Menu menu_ = Menu::Quick;
 	OverlayAction saveStateMode_ = OverlayAction::SaveState;
@@ -235,13 +223,6 @@ private:
 	std::string title_;
 	Draw::Texture *raIconTexture_ = nullptr;
 	Draw::Texture *focusTexture_ = nullptr;
-	Draw::Texture *maskTexture_ = nullptr;
-	// A texture may still be referenced by a submitted ImGui draw list when a
-	// GameDB mask is changed.  Keep replaced textures alive until Shutdown
-	// rather than releasing an in-flight Thin3D resource.
-	std::vector<Draw::Texture *> retiredMaskTextures_;
-	bool gameMaskEnabled_ = false;
-	std::string gameMaskPath_;
 	bool gameShaderEnabled_ = false;
 	std::string gameShaderSection_;
 	ImGuiContext *context_ = nullptr;

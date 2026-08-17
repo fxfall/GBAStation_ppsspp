@@ -1497,13 +1497,6 @@ void ApplyPspGameDbShaderSettings(const nlohmann::json &item) {
 	}
 }
 
-void ApplyPspGameDbMaskSettings(const nlohmann::json &item) {
-	if (!g_state.overlay.IsReady())
-		return;
-	g_state.overlay.SetGameMaskSettings(JsonBoolOr(item, "overlayEnabled"),
-		NormalizeGameDbPath(JsonStringOr(item, "overlayPath")));
-}
-
 void SavePspGameDbDisplaySettings() {
 	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size())
 		return;
@@ -1530,8 +1523,6 @@ void SavePspGameDbDisplaySettings() {
 	item.erase("ppssppCustomScale");
 	item.erase("ppssppCustomOffsetX");
 	item.erase("ppssppCustomOffsetY");
-	item["overlayEnabled"] = g_state.overlay.IsGameMaskEnabled();
-	item["overlayPath"] = NormalizeGameDbPath(g_state.overlay.GameMaskPath());
 	g_state.gameDbDirty = true;
 	FlushPspGameDb();
 }
@@ -1619,18 +1610,6 @@ void SyncPspGameDbDisplaySettings() {
 	});
 }
 
-void SyncPspGameDbMaskSettings() {
-	SavePspGameDbDisplaySettings();
-	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size()) return;
-	const auto &source = g_state.gameDbData[g_state.gameDbIndex];
-	const bool enabled = JsonBoolOr(source, "overlayEnabled");
-	const std::string path = NormalizeGameDbPath(JsonStringOr(source, "overlayPath"));
-	SyncPspGameDb("mask settings", [=](nlohmann::json &item) {
-		item["overlayEnabled"] = enabled;
-		item["overlayPath"] = path;
-	});
-}
-
 void SyncPspGameDbShaderSettings() {
 	SavePspGameDbShaderSettings();
 	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size()) return;
@@ -1688,8 +1667,7 @@ void LoadPspPlayStats(const std::string& romPath) {
             // being updated for its play counter.  The launcher consumes the
             // normalized schema paths on its next scan.
             item["savePath"] = g_state.savePath;
-            item["overlayPath"] = NormalizeGameDbPath(JsonStringOr(item, "overlayPath"));
-            item["shaderPath"] = NormalizeGameDbPath(JsonStringOr(item, "shaderPath"));
+			item["shaderPath"] = NormalizeGameDbPath(JsonStringOr(item, "shaderPath"));
             item["shaderParaPath"] = "";
             item["playCount"] = g_state.playCount;
             g_state.gameDbData = std::move(data);
@@ -1700,7 +1678,6 @@ void LoadPspPlayStats(const std::string& romPath) {
 			const auto &cachedItem = g_state.gameDbData[g_state.gameDbIndex];
 			ApplyPspGameDbDisplaySettings(cachedItem);
 			ApplyPspGameDbShaderSettings(cachedItem);
-			ApplyPspGameDbMaskSettings(cachedItem);
             Log("GBAStation play stats start playCount=%d playTime=%d", g_state.playCount, g_state.playTimeTotal);
             return;
         }
@@ -2398,9 +2375,6 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 	if (g_state.overlay.ConsumeSyncDisplaySettingsRequest()) {
 		SyncPspGameDbDisplaySettings();
 	}
-	if (g_state.overlay.ConsumeSyncMaskSettingsRequest()) {
-		SyncPspGameDbMaskSettings();
-	}
 	if (g_state.overlay.ConsumeSyncShaderSettingsRequest()) {
 		SyncPspGameDbShaderSettings();
 	}
@@ -2570,7 +2544,6 @@ void PpssppRuntime::RunFrame() {
 			if (g_state.gameDbLoaded && g_state.gameDbIndex < g_state.gameDbData.size()) {
 				ApplyPspGameDbDisplaySettings(g_state.gameDbData[g_state.gameDbIndex]);
 				ApplyPspGameDbShaderSettings(g_state.gameDbData[g_state.gameDbIndex]);
-				ApplyPspGameDbMaskSettings(g_state.gameDbData[g_state.gameDbIndex]);
 			}
 			RefreshCheatAvailability();
 		}

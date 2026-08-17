@@ -424,7 +424,9 @@ int ConfigInt(const char *key, int fallback) {
 
 void ApplyGBAStationPpssppCoreSettings() {
 	g_Config.iInternalResolution =
-		std::clamp(ConfigInt("core.ppsspp.rendering_resolution", g_Config.iInternalResolution), 1, 10);
+		// This menu is per-game and persists through GameDB's
+		// ndsInternalResolution field, which supports 1x..4x only.
+		std::clamp(ConfigInt("core.ppsspp.rendering_resolution", g_Config.iInternalResolution), 1, 4);
 	g_Config.iFrameSkip =
 		std::clamp(ConfigInt("core.ppsspp.frameskip", g_Config.iFrameSkip), 0, 8);
 	g_Config.bAutoFrameSkip = ConfigBool("core.ppsspp.auto_frameskip", g_Config.bAutoFrameSkip);
@@ -1439,9 +1441,21 @@ void ApplyPspGameDbDisplaySettings(const nlohmann::json &item) {
 	const float customOffsetY = 0.5f + item.value("customOffsetY", 0.0f) / std::max(1, g_display.pixel_yres);
 	if (displayMode < 0 && internalResolution < 0 && screenLayout.empty())
 		return;
-	if (g_state.overlay.IsReady())
+	const int previousResolution = g_Config.iInternalResolution;
+	if (g_state.overlay.IsReady()) {
 		g_state.overlay.SetGameDisplaySettings(displayMode, screenLayout, internalResolution,
 			customScale, customOffsetX, customOffsetY);
+		// GameDB is loaded after the Vulkan GPU has been created.  Merely changing
+		// g_Config here updated the menu label, but left the existing render targets
+		// at the startup resolution.  Queue the same live resize path used by the
+		// selector so the displayed multiplier always matches the active one.
+		if (g_Config.iInternalResolution != previousResolution) {
+			g_state.runtimeSettingsDirty = true;
+			g_state.settingsRenderResized = true;
+			Log("GBAStation GameDB display resolution applied old=%d new=%d", previousResolution,
+				g_Config.iInternalResolution);
+		}
+	}
 }
 
 void ApplyPspGameDbShaderSettings(const nlohmann::json &item) {
@@ -1506,8 +1520,8 @@ void SavePspGameDbDisplaySettings() {
 	item["displayMode"] = g_state.overlay.GameDisplayModeIndex();
 	item["ndsScreenLayout"] = g_state.overlay.GameScreenLayout();
 	// The shared launcher schema clamps this NDS-named storage field to 1..4.
-	// PPSSPP can still use 5x for the live session, but no fifth persistent
-	// GameDB representation exists without inventing a new field.
+	// Do not create an unrepresentable 5x per-game value: it would be silently
+	// reduced to 4x by the launcher and make synchronization appear to fail.
 	item["ndsInternalResolution"] = std::clamp(g_Config.iInternalResolution, 1, 4);
 	item["customScale"] = g_state.overlay.GameCustomDisplayScale();
 	item["customOffsetX"] = (g_state.overlay.GameCustomDisplayOffsetX() - 0.5f) * std::max(1, g_display.pixel_xres);
@@ -1589,7 +1603,8 @@ void SyncPspGameDbDisplaySettings() {
 	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size()) return;
 	const auto &source = g_state.gameDbData[g_state.gameDbIndex];
 	const int mode = JsonIntOr(source, "displayMode", -1);
-	const int resolution = JsonIntOr(source, "ndsInternalResolution", -1);
+	const int storedResolution = JsonIntOr(source, "ndsInternalResolution", -1);
+	const int resolution = storedResolution < 1 ? -1 : std::clamp(storedResolution, 1, 4);
 	const std::string layout = JsonStringOr(source, "ndsScreenLayout");
 	const float integerScale = source.value("integerAspectRatio", 1.0f);
 	const float customScale = source.value("customScale", 1.0f);

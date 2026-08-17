@@ -797,7 +797,10 @@ void Overlay::SetGameDisplaySettings(int displayMode, const std::string &screenL
 	float customScale, float customOffsetX, float customOffsetY) {
 	hasGameDisplaySettings_ = true;
 	if (internalResolution >= 0)
-		g_Config.iInternalResolution = std::clamp(internalResolution, 0, 10);
+		// Per-game display settings use the shared GameDB ndsInternalResolution
+		// field, whose supported range is 1x..4x.  Keep the live value in the
+		// same range so the selector, saved entry, and a later sync cannot drift.
+		g_Config.iInternalResolution = std::clamp(internalResolution, 1, 4);
 
 	if (displayMode == static_cast<int>(DisplayMode::Integer))
 		displaySettings_.mode = DisplayMode::Integer;
@@ -954,8 +957,8 @@ void Overlay::CycleSetting(int direction) {
 	// 画面设置 page.
 	if (settingsSelection_ == 0) {
 		int resolution = g_Config.iInternalResolution;
-		if (resolution < 1 || resolution > 5) resolution = 1;
-		resolution = (resolution - 1 + direction + 5) % 5 + 1;
+		if (resolution < 1 || resolution > 4) resolution = 1;
+		resolution = (resolution - 1 + direction + 4) % 4 + 1;
 		g_Config.iInternalResolution = resolution;
 		// Rendering resolution is a display setting in the in-game menu.  It
 		// belongs to the current GameDB entry and must not overwrite the
@@ -1852,7 +1855,7 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 			auto enabled = [](bool value) { return value ? std::string(tr("开启")) : std::string(tr("关闭")); };
 			auto settingValue = [&](int index) {
 				switch (index) {
-				case 0: return std::to_string(std::clamp(g_Config.iInternalResolution, 1, 5));
+				case 0: return std::to_string(std::clamp(g_Config.iInternalResolution, 1, 4));
 				case 1: return TranslatedDisplayModeLabel(displaySettings_.mode);
 				case 2: return displaySettings_.mode == DisplayMode::Display
 					? TranslatedDisplaySizeLabel(displaySettings_.size) : std::string("—");

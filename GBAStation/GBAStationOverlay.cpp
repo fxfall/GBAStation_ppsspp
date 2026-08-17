@@ -1072,7 +1072,9 @@ void Overlay::CycleSetting(int direction) {
 		if (resolution < 1 || resolution > 5) resolution = 1;
 		resolution = (resolution - 1 + direction + 5) % 5 + 1;
 		g_Config.iInternalResolution = resolution;
-		coreSettingsChanged_ = true;
+		// Rendering resolution is a display setting in the in-game menu.  It
+		// belongs to the current GameDB entry and must not overwrite the
+		// launcher's PPSSPP-wide default when the menu is closed.
 		gameDisplaySettingsSaveRequested_ = true;
 		return;
 	}
@@ -1088,7 +1090,7 @@ void Overlay::CycleSetting(int direction) {
 		return;
 	}
 	if (settingsSelection_ == 2) {
-		if (displaySettings_.mode == DisplayMode::Custom) return;
+		if (displaySettings_.mode != DisplayMode::Display) return;
 		displaySettings_ = NormalizePpssppDisplaySettingsForCurrentMode(displaySettings_);
 		displaySettings_.size = CycleDisplaySize(displaySettings_.size,
 			&kAspectDisplaySizes[1], 2, direction);
@@ -1097,7 +1099,7 @@ void Overlay::CycleSetting(int direction) {
 		return;
 	}
 	if (settingsSelection_ == 3) {
-		if (displaySettings_.mode == DisplayMode::Custom) return;
+		if (displaySettings_.mode != DisplayMode::Integer) return;
 		const DisplaySize sizes[] = {DisplaySize::_1x, DisplaySize::_2x, DisplaySize::_3x, DisplaySize::_4x};
 		displaySettings_.size = CycleDisplaySize(displaySettings_.size, sizes, 4, direction);
 		ApplyDisplaySettings(false);
@@ -2029,8 +2031,10 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 				switch (index) {
 				case 0: return std::to_string(std::clamp(g_Config.iInternalResolution, 1, 5));
 				case 1: return TranslatedDisplayModeLabel(displaySettings_.mode);
-				case 2: return displaySettings_.size == DisplaySize::_4_3 ? std::string("4:3") : std::string("16:9");
-				case 3: return TranslatedDisplaySizeLabel(displaySettings_.size);
+				case 2: return displaySettings_.mode == DisplayMode::Display
+					? TranslatedDisplaySizeLabel(displaySettings_.size) : std::string("—");
+				case 3: return displaySettings_.mode == DisplayMode::Integer
+					? TranslatedDisplaySizeLabel(displaySettings_.size) : std::string("—");
 				case 4: return std::string(">");
 				case 5: {
 					const std::string filters[] = {tr("默认"), tr("自动"), tr("最近邻"), tr("线性"), tr("高质量")};
@@ -2051,7 +2055,8 @@ void Overlay::DrawMenu(ImDrawList *drawList, ImVec2 displaySize, float scale, fl
 				drawSectionHeader(viewTop + (headerPositions[i] - scroll) * (rowH + rowGap), tr(headers[i]));
 			for (int index = 0; index < 13; ++index) {
 				EncodeUtf8(icon, rowIcons[index]);
-				const bool rowEnabled = !(((index == 2 || index == 3) && displaySettings_.mode == DisplayMode::Custom) ||
+				const bool rowEnabled = !((index == 2 && displaySettings_.mode != DisplayMode::Display) ||
+					(index == 3 && displaySettings_.mode != DisplayMode::Integer) ||
 					(index == 4 && displaySettings_.mode != DisplayMode::Custom));
 				const bool selector = index < 4 || (index >= 5 && index < 8);
 				drawRow(positions[index] - scroll, inContent && index == selection_, icon, labels[index],

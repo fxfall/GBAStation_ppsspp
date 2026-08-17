@@ -2409,13 +2409,18 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 		// during Shutdown for a direct exit).
 		g_state.runtimeSettingsSavePending = true;
 		g_state.settingsRenderResized = g_state.settingsRenderResized ||
-			g_Config.iInternalResolution != prevResolution ||
 			g_Config.bSkipBufferEffects != prevSkipBufferEffects;
 		g_state.settingsJitClear = g_state.settingsJitClear || g_Config.bFastMemory != prevFastMemory;
 		Log("queued PPSSPP runtime core settings (debounced)");
 	}
 	if (g_state.overlay.ConsumeGameDisplaySettingsSaveRequest()) {
 		g_state.gameDisplaySettingsSavePending = true;
+		// Per-game resolution changes still need the live GPU targets to be
+		// recreated, but do not require saving the global PPSSPP configuration.
+		if (g_Config.iInternalResolution != prevResolution) {
+			g_state.runtimeSettingsDirty = true;
+			g_state.settingsRenderResized = true;
+		}
 	}
 	if (g_state.overlay.ConsumeGameShaderSettingsSaveRequest()) {
 		SavePspGameDbShaderSettings();

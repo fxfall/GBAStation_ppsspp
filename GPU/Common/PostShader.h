@@ -21,10 +21,13 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "Common/GPU/thin3d.h"
+#include "GPU/Common/Slang/slang_types.h"
+#include "GPU/Common/Slang/slang_process.h"
 
 struct ShaderInfo {
 	Path iniFile;  // which ini file was this definition in? So we can write settings back later
@@ -59,6 +62,16 @@ struct ShaderInfo {
 	};
 	Setting settings[4];
 
+	// Slang (.slangp) support. When isSlang, this ShaderInfo represents one pass
+	// of a RetroArch slang preset.
+	bool isSlang = false;
+	// Pass index within the preset.
+	int slangPassIndex = -1;
+	// Shared preset (all passes of the same preset share this).
+	std::shared_ptr<SlangPreset> slangPreset;
+	// Compiled data for this pass.
+	std::shared_ptr<SlangPassCompiled> slangCompiled;
+
 	// TODO: Add support for all kinds of fun options like mapping the depth buffer,
 	// SRGB texture reads, etc.  prev shader?
 
@@ -72,6 +85,8 @@ struct ShaderInfo {
 	bool operator < (const ShaderInfo &other) const {
 		if (name < other.name) return true;
 		if (name > other.name) return false;
+		// Keep slang passes in order.
+		if (slangPassIndex != other.slangPassIndex) return slangPassIndex < other.slangPassIndex;
 		// Tie breaker
 		if (iniFile < other.iniFile) return true;
 		if (iniFile > other.iniFile) return false;
@@ -112,6 +127,10 @@ struct TextureShaderInfo {
 };
 
 void ReloadAllPostShaderInfo(Draw::DrawContext *draw);
+// Registers an absolute .slangp chosen by the GBAStation picker. The path is
+// retained across ReloadAllPostShaderInfo() calls, avoiding platform-specific
+// custom-directory enumeration failures.
+bool RegisterSlangPresetPath(const std::string &path, std::string *error = nullptr);
 
 const ShaderInfo *GetPostShaderInfo(std::string_view name);
 std::vector<const ShaderInfo *> GetPostShaderChain(const std::string &name);

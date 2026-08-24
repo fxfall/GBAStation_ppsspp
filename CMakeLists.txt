@@ -1687,6 +1687,8 @@ list(APPEND NativeAppSource
 	UI/DevScreens.h
 	UI/DisplayLayoutScreen.cpp
 	UI/DisplayLayoutScreen.h
+	UI/SlangShaderScreen.cpp
+	UI/SlangShaderScreen.h
 	UI/EmuScreen.h
 	UI/EmuScreen.cpp
 	UI/GameInfoCache.h
@@ -2121,6 +2123,17 @@ set(GPU_SOURCES
 	GPU/Common/TextureScalerCommon.h
 	GPU/Common/PostShader.cpp
 	GPU/Common/PostShader.h
+	GPU/Common/Slang/SlangRuntime.cpp
+	GPU/Common/Slang/SlangRuntime.h
+	GPU/Common/Slang/slang_compile.cpp
+	GPU/Common/Slang/slang_compile.h
+	GPU/Common/Slang/slang_process.cpp
+	GPU/Common/Slang/slang_process.h
+	GPU/Common/Slang/slang_reflection.cpp
+	GPU/Common/Slang/slang_reflection.hpp
+	GPU/Common/Slang/slang_types.h
+	GPU/Common/Slang/slangp_parser.cpp
+	GPU/Common/Slang/slangp_parser.h
 	GPU/Common/TextureReplacer.cpp
 	GPU/Common/TextureReplacer.h
 	GPU/Common/ReplacedTexture.cpp

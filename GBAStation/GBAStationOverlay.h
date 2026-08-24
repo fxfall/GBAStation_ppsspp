@@ -69,6 +69,33 @@ public:
 	void SetCheatsEnabled(bool enabled);
 	void SetCheatInfo(bool enabled, bool available, const std::vector<CheatMenuEntry> &entries);
 	void ReloadDisplaySettings();
+	// Per-title display values come from the launcher GameDB.  Keep them in the
+	// overlay rather than reloading the global core config whenever the menu is
+	// opened, otherwise one game's aspect/scale leaks into the next game.
+	void SetGameDisplaySettings(int displayMode, const std::string &screenLayout, int internalResolution,
+		float customScale = 1.0f, float customOffsetX = 0.5f, float customOffsetY = 0.5f);
+	void SetGameShaderSettings(bool enabled, const std::string &section);
+	bool IsGameShaderEnabled() const { return gameShaderEnabled_; }
+	const std::string &GameShaderSection() const { return gameShaderSection_; }
+	// These requests are deliberately one-shot.  The runtime owns GameDB and
+	// applies a confirmed request to every *other* PSP entry.
+	bool ConsumeSyncDisplaySettingsRequest();
+	bool ConsumeSyncShaderSettingsRequest();
+	bool ConsumeGameDisplaySettingsSaveRequest() {
+		const bool requested = gameDisplaySettingsSaveRequested_;
+		gameDisplaySettingsSaveRequested_ = false;
+		return requested;
+	}
+	bool ConsumeGameShaderSettingsSaveRequest() {
+		const bool requested = gameShaderSettingsSaveRequested_;
+		gameShaderSettingsSaveRequested_ = false;
+		return requested;
+	}
+	int GameDisplayModeIndex() const { return static_cast<int>(displaySettings_.mode); }
+	const char *GameScreenLayout() const { return DisplaySizeLabel(displaySettings_.size); }
+	float GameCustomDisplayScale() const { return displaySettings_.customScale; }
+	float GameCustomDisplayOffsetX() const { return displaySettings_.customOffsetX; }
+	float GameCustomDisplayOffsetY() const { return displaySettings_.customOffsetY; }
 
 	bool IsReady() const { return ready_; }
 	bool IsVisible() const { return visible_; }
@@ -79,6 +106,9 @@ public:
 	}
 	bool ShouldExitGame() const { return exitRequested_; }
 	void ClearExitRequest() { exitRequested_ = false; }
+	// The runtime keeps the menu alive while the configured exit savestate and
+	// its thumbnail are written.  This state deliberately consumes all input.
+	void SetExitSaving(bool saving, bool waitingForNativeSave = false);
 	OverlayCommand ConsumeCommand();
 	void SetVisible(bool visible);
 
@@ -89,6 +119,21 @@ private:
 		Cheats,
 		Settings,
 	};
+	enum class SettingsSidebar {
+		None,
+		Shader,
+		Custom,
+		ShaderPicker,
+	};
+	struct PickerEntry {
+		std::string label;
+		std::string path;
+	};
+	enum class SyncConfirm {
+		None,
+		Display,
+		Shader,
+	};
 
 	int ItemCount() const;
 	int QuickMenuStorageIndex(int visibleIndex) const;
@@ -98,7 +143,13 @@ private:
 	void DrawMenu(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
 	void DrawHelpers(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
 	void DrawRAAlerts(Draw::DrawContext *draw, ::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float deltaTime);
+	void DrawSyncConfirmDialog(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
+	void DrawExitSavingDialog(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
+	void DrawSettingsSidebar(::ImDrawList *drawList, ::ImVec2 displaySize, float scale, float ease);
 	void CycleSetting(int direction);
+	void OpenSettingsSidebar(SettingsSidebar sidebar);
+	void ReloadPickerEntries();
+	bool HandleSettingsSidebarInput(u64 buttons, u64 pressed, bool navUp, bool navDown, bool navLeft, bool navRight);
 	void ActivateTab(int tab);
 	void ApplyDisplaySettings(bool save);
 	Draw::Texture *LoadRAIconTexture(Draw::DrawContext *draw);
@@ -113,12 +164,26 @@ private:
 	bool visible_ = false;
 	bool comboDown_ = false;
 	bool exitRequested_ = false;
+	bool exitSaving_ = false;
+	bool exitWaitingForNativeSave_ = false;
 	int selection_ = 0;
 	int tabSelection_ = 0;
 	bool sidebarFocused_ = true;
 	int settingsSelection_ = 0;
 	bool coreSettingsPage_ = false;
 	bool coreSettingsChanged_ = false;
+	bool gameDisplaySettingsSaveRequested_ = false;
+	bool gameShaderSettingsSaveRequested_ = false;
+	bool syncDisplaySettingsRequested_ = false;
+	bool syncShaderSettingsRequested_ = false;
+	SyncConfirm syncConfirm_ = SyncConfirm::None;
+	SettingsSidebar settingsSidebar_ = SettingsSidebar::None;
+	int sidebarSelection_ = 0;
+	int sidebarAdjustDir_ = 0;
+	u64 sidebarAdjustStartMs_ = 0;
+	u64 sidebarAdjustNextMs_ = 0;
+	std::vector<PickerEntry> pickerEntries_;
+	bool hasGameDisplaySettings_ = false;
 	Menu menu_ = Menu::Quick;
 	OverlayAction saveStateMode_ = OverlayAction::SaveState;
 	DisplaySettings displaySettings_;
@@ -141,10 +206,15 @@ private:
 	u64 lastAnalogNavMs_ = 0;
 	u64 lastDPadNavMs_ = 0;
 	// 3DS-style d-pad repeat: first repeat waits 280 ms, then speeds up.
-	static constexpr u64 kDPadNavInitialRepeatMs = 280;
+	static constexpr u64 kDPadNavInitialRepeatMs = 360;
 	int dpadNavDir_ = 0;
 	u64 nextDPadNavMs_ = 0;
 	u64 dpadNavStartMs_ = 0;
+	// LR selectors use their own repeat track so settings can be adjusted
+	// smoothly without accelerating general menu navigation.
+	int selectorAdjustDir_ = 0;
+	u64 selectorAdjustStartMs_ = 0;
+	u64 selectorAdjustNextMs_ = 0;
 	u64 nextCheatVerticalNavMs_ = 0;
 	u64 nextCheatHorizontalNavMs_ = 0;
 	int cheatVerticalNavDir_ = 0;
@@ -153,6 +223,8 @@ private:
 	std::string title_;
 	Draw::Texture *raIconTexture_ = nullptr;
 	Draw::Texture *focusTexture_ = nullptr;
+	bool gameShaderEnabled_ = false;
+	std::string gameShaderSection_;
 	ImGuiContext *context_ = nullptr;
 };
 

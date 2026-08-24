@@ -17,8 +17,14 @@
 
 #pragma once
 
+#include <array>
+#include <map>
+#include <memory>
+#include <vector>
+
 #include "Common/Common.h"
 #include "Common/GPU/Shader.h"
+#include "GPU/Common/Slang/slang_process.h"
 
 struct CardboardSettings {
 	bool enabled;
@@ -146,9 +152,13 @@ protected:
 
 	Draw::ShaderModule *CompileShaderModule(ShaderStage stage, ShaderLanguage lang, const std::string &src, std::string *errorString) const;
 	Draw::Pipeline *CreatePipeline(std::vector<Draw::ShaderModule *> shaders, bool postShader, const UniformBufferDesc *uniformDesc) const;
+	// Slang passes use the RetroArch attribute convention (location 0 = position, 1 = texcoord).
+	Draw::Pipeline *CreateSlangPipeline(std::vector<Draw::ShaderModule *> shaders, const UniformBufferDesc *uniformDesc) const;
 	bool CompilePostShader(const ShaderInfo *shaderInfo, Draw::Pipeline **outPipeline) const;
+	// Compiles a single slang pass of a preset, caching the result.
+	bool CompileSlangPass(const ShaderInfo *shaderInfo, Draw::Pipeline **outPipeline) const;
 	bool BuildPostShader(const DisplayLayoutConfig &config, const ShaderInfo *shaderInfo, const ShaderInfo *next, Draw::Pipeline **outPipeline);
-	bool AllocateFramebuffer(int w, int h);
+	bool AllocateFramebuffer(int w, int h, bool allowReuse = true);
 
 	bool BindSource(int binding, bool bindStereo);
 
@@ -160,12 +170,23 @@ protected:
 	Draw::Pipeline *texColorRBSwizzle_ = nullptr;
 	Draw::SamplerState *samplerNearest_ = nullptr;
 	Draw::SamplerState *samplerLinear_ = nullptr;
+	std::array<std::array<Draw::SamplerState *, 2>, 4> slangSamplers_{};
 	Draw::Buffer *vdata_ = nullptr;
 
 	std::vector<Draw::Pipeline *> postShaderPipelines_;
 	std::vector<Draw::Framebuffer *> postShaderFramebuffers_;
 	std::vector<ShaderInfo> postShaderInfo_;
 	std::vector<Draw::Framebuffer *> previousFramebuffers_;
+	std::vector<std::array<Draw::Framebuffer *, 2>> slangFeedbackFramebuffers_;
+	std::vector<bool> slangFeedbackValid_;
+	int slangFeedbackIndex_ = 0;
+	// Slang compiled passes, keyed by section::passIndex.
+	mutable std::map<std::string, std::shared_ptr<SlangPassCompiled>> slangCompiledMap_;
+	mutable std::map<std::string, std::shared_ptr<SlangPreset>> slangPresetMap_;
+	// Loaded LUT textures (slang user textures).
+	mutable std::map<std::string, Draw::Texture *> lutTextures_;
+	Draw::Texture *GetLutTexture(const std::shared_ptr<SlangPreset> &preset, unsigned index) const;
+	double lastSlangTime_ = 0.0;
 	
 	Draw::Pipeline *stereoPipeline_ = nullptr;
 	ShaderInfo *stereoShaderInfo_ = nullptr;

@@ -45,12 +45,16 @@
 #include "Core/FrameTiming.h"
 #include "Core/HLE/sceCtrl.h"
 #include "Core/HLE/sceDisplay.h"
+#include "Core/HLE/sceUtility.h"
+#include "Core/HW/Display.h"
 #include "Core/HW/StereoResampler.h"
 #include "Core/MemMapHelpers.h"
 #include "Core/SaveState.h"
 #include "dep/nlohmann/json.hpp"
 #include "Core/Screenshot.h"
 #include "GPU/Common/FramebufferManagerCommon.h"
+#include "GPU/Common/PostShader.h"
+#include "GPU/GPU.h"
 #include "Core/Screenshot.h"
 #include "Core/System.h"
 #include "Core/Util/PathUtil.h"
@@ -64,6 +68,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdarg>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -80,6 +85,7 @@
 #include <zlib.h>
 
 namespace GBAStation {
+static void WriteConfigValue(const char *key, const std::string &value);
 namespace {
 
 constexpr int kAudioSampleRate = 48000;
@@ -104,8 +110,13 @@ struct RuntimeState {
 	bool frameOpen = false;
 	bool hostFrameOpen = false;
 	bool ppssppShutdown = false;
+	// A reset requested while a PSP savedata dialog is completing is held until
+	// the dialog has finished its worker-thread write and guest handshake.
+	bool resetPending = false;
 	bool chainloadLauncher = false;
 	bool runtimeSettingsDirty = false;
+	bool runtimeSettingsSavePending = false;
+	bool gameDisplaySettingsSavePending = false;
 	bool settingsRenderResized = false;
 	bool settingsJitClear = false;
 	std::string contentPath;
@@ -118,6 +129,16 @@ struct RuntimeState {
 	double playTimeLastMs = 0.0;
 	int autoLoadStateSlot = 0;
 	int autoSaveOnExitSlot = 0;
+	// A menu-initiated exit keeps the normal frame loop alive until its queued
+	// SaveState operation and thumbnail PNG have both finished.
+	bool exitSavePending = false;
+	bool exitSaveFinished = false;
+	u64 exitSaveStartedMs = 0;
+	std::string exitSavePath;
+	// Native PSP saves use sceUtility's worker thread and guest shutdown
+	// handshake.  Exit waits for it before pausing the core for our savestate.
+	bool exitWaitingForNativeSave = false;
+	u64 exitNativeSaveClearMs = 0;
 	std::string savePath; // per-game save dir from the launcher GameDB (savePath field)
 	// Cached GameDB entry (loaded once at boot; title/logo updates mutate it in
 	// memory and a single flush writes it back).
@@ -155,6 +176,7 @@ struct RuntimeState {
 	bool fastForwardToggle = false;
 	bool fastForwardToggleMode = false;
 	float fastForwardMultiplier = 2.0f;
+	bool fastForwardSettingsSavePending = false;
 	// State thumbnail: captured two frames after the menu closes (pure gameplay).
 	// Menu-open thumbnail: captured into memory when the menu button is pressed,
 	// written to a PNG next to the state file when a state is saved.
@@ -167,8 +189,6 @@ struct RuntimeState {
 	bool fastForwardActive = false;
 	// FPS counter for the HUD.
 	double fps = 60.0;
-	int fpsFrameCount = 0;
-	u64 fpsWindowStartMs = 0;
 };
 
 RuntimeState g_state;
@@ -225,8 +245,15 @@ std::string Trim(std::string_view value) {
 
 std::string DecodeConfigValue(std::string_view encoded) {
 	std::string value = Trim(encoded);
-	if (value.size() > 2 && value[1] == '|' && value[0] == 's') {
+	if (value.size() > 2 && value[1] == '|') {
+		const char type = value[0];
 		value.erase(0, 2);
+		// Boolean and numeric launcher settings use b| / i| / f|.  They do
+		// not need string unescaping, but the type prefix must never leak into
+		// consumers such as display.showFps.
+		if (type != 's') {
+			return value;
+		}
 		std::string decoded;
 		decoded.reserve(value.size());
 		bool escaped = false;
@@ -274,8 +301,8 @@ void LoadGBAStationConfig() {
 	if (const auto it = g_state.gbastationConfig.find("fastforward.multiplier");
 		it != g_state.gbastationConfig.end()) {
 		try {
-			g_state.fastForwardMultiplier =
-				std::clamp(std::stof(it->second), 0.5f, 5.0f);
+			const float value = std::stof(it->second);
+			g_state.fastForwardMultiplier = value <= 0.001f ? 0.0f : std::clamp(value, 0.5f, 5.0f);
 		} catch (...) {
 		}
 	}
@@ -397,10 +424,13 @@ int ConfigInt(const char *key, int fallback) {
 
 void ApplyGBAStationPpssppCoreSettings() {
 	g_Config.iInternalResolution =
-		std::clamp(ConfigInt("core.ppsspp.rendering_resolution", g_Config.iInternalResolution), 1, 10);
+		// This menu is per-game and persists through GameDB's
+		// ndsInternalResolution field, which supports 1x..4x only.
+		std::clamp(ConfigInt("core.ppsspp.rendering_resolution", g_Config.iInternalResolution), 1, 4);
 	g_Config.iFrameSkip =
 		std::clamp(ConfigInt("core.ppsspp.frameskip", g_Config.iFrameSkip), 0, 8);
 	g_Config.bAutoFrameSkip = ConfigBool("core.ppsspp.auto_frameskip", g_Config.bAutoFrameSkip);
+	g_Config.bRenderDuplicateFrames = ConfigBool("core.ppsspp.render_duplicate_frames", g_Config.bRenderDuplicateFrames);
 	g_Config.bFastMemory = ConfigBool("core.ppsspp.fast_memory", g_Config.bFastMemory);
 	g_Config.iIOTimingMethod = ConfigBool("core.ppsspp.io_thread", true) ? IOTIMING_FAST : IOTIMING_HOST;
 	Log("applied GBAStation PPSSPP config res=%d frameskip=%d auto=%d fastmem=%d io=%d",
@@ -419,6 +449,7 @@ void SaveGBAStationPpssppRuntimeSettings() {
 	raw.SetValue("ppsspp_internal_resolution", std::to_string(std::max(0, g_Config.iInternalResolution)));
 	raw.SetValue("ppsspp_frameskip", std::to_string(std::max(0, g_Config.iFrameSkip)));
 	raw.SetValue("ppsspp_auto_frameskip", enabled(g_Config.bAutoFrameSkip));
+	raw.SetValue("ppsspp_render_duplicate_frames", enabled(g_Config.bRenderDuplicateFrames));
 	raw.SetValue("ppsspp_fast_memory", enabled(g_Config.bFastMemory));
 	raw.SetValue("ppsspp_gpu_hardware_transform", enabled(g_Config.bHardwareTransform));
 	raw.SetValue("ppsspp_skip_buffer_effects", enabled(g_Config.bSkipBufferEffects));
@@ -427,6 +458,17 @@ void SaveGBAStationPpssppRuntimeSettings() {
 	raw.SetValue("ppsspp_texture_anisotropic_filtering", kAnisotropy[std::clamp(g_Config.iAnisotropyLevel, 0, 4)]);
 	raw.SetValue("ppsspp_texture_deposterize", enabled(g_Config.bTexDeposterize));
 	raw.Save();
+	WriteConfigValue("core.ppsspp.rendering_resolution", std::to_string(std::max(1, g_Config.iInternalResolution)));
+	WriteConfigValue("core.ppsspp.frameskip", std::to_string(std::max(0, g_Config.iFrameSkip)));
+	WriteConfigValue("core.ppsspp.auto_frameskip", enabled(g_Config.bAutoFrameSkip));
+	WriteConfigValue("core.ppsspp.render_duplicate_frames", enabled(g_Config.bRenderDuplicateFrames));
+	WriteConfigValue("core.ppsspp.fast_memory", enabled(g_Config.bFastMemory));
+	WriteConfigValue("core.ppsspp.ppsspp_gpu_hardware_transform", enabled(g_Config.bHardwareTransform));
+	WriteConfigValue("core.ppsspp.ppsspp_skip_buffer_effects", enabled(g_Config.bSkipBufferEffects));
+	WriteConfigValue("core.ppsspp.ppsspp_vsync", enabled(g_Config.bVSync));
+	WriteConfigValue("core.ppsspp.ppsspp_texture_filtering", kFiltering[std::clamp(g_Config.iTexFiltering, 0, 4)]);
+	WriteConfigValue("core.ppsspp.ppsspp_texture_anisotropic_filtering", kAnisotropy[std::clamp(g_Config.iAnisotropyLevel, 0, 4)]);
+	WriteConfigValue("core.ppsspp.ppsspp_texture_deposterize", enabled(g_Config.bTexDeposterize));
 	Log("saved PPSSPP runtime core settings");
 }
 
@@ -434,6 +476,8 @@ void ApplyGBAStationPpssppDisplaySettings(DisplaySettings &settings) {
 	const std::string mode = ConfigValue("core.ppsspp.display_mode", "");
 	if (mode == "Integer") {
 		settings.mode = DisplayMode::Integer;
+	} else if (mode == "Custom") {
+		settings.mode = DisplayMode::Custom;
 	} else if (mode == "Display") {
 		settings.mode = DisplayMode::Display;
 	}
@@ -1288,6 +1332,69 @@ std::string NormalizePsRomPath(std::string path) {
     return path;
 }
 
+std::string NormalizeGameDbPath(std::string path) {
+	path = NormalizePsRomPath(std::move(path));
+	return path;
+}
+
+std::string JsonStringOr(const nlohmann::json &item, const char *key, const std::string &fallback = {}) {
+	const auto it = item.find(key);
+	return it != item.end() && it->is_string() ? it->get<std::string>() : fallback;
+}
+
+int JsonIntOr(const nlohmann::json &item, const char *key, int fallback = 0) {
+	const auto it = item.find(key);
+	return it != item.end() && (it->is_number_integer() || it->is_number_unsigned()) ? it->get<int>() : fallback;
+}
+
+bool JsonBoolOr(const nlohmann::json &item, const char *key, bool fallback = false) {
+	const auto it = item.find(key);
+	return it != item.end() && it->is_boolean() ? it->get<bool>() : fallback;
+}
+
+bool WriteGameDbAtomically(const std::string &path, const nlohmann::json &data) {
+	const std::string tempPath = path + ".tmp";
+	{
+		std::ofstream out(tempPath, std::ios::binary | std::ios::trunc);
+		if (!out) {
+			Log("GBAStation GameDB temporary write failed: %s", tempPath.c_str());
+			return false;
+		}
+		out << data.dump(4);
+		out.flush();
+		if (!out) {
+			out.close();
+			std::remove(tempPath.c_str());
+			Log("GBAStation GameDB temporary flush failed: %s", tempPath.c_str());
+			return false;
+		}
+	}
+	if (std::rename(tempPath.c_str(), path.c_str()) == 0) {
+		return true;
+	}
+	// Horizon's FAT layer does not replace an existing destination on rename.
+	// Move the old complete file aside and restore it if promoting the prepared
+	// temporary file fails, so a failed update never leaves GameDB truncated.
+	const std::string backupPath = path + ".bak";
+	if (std::rename(path.c_str(), backupPath.c_str()) != 0) {
+		const int error = errno;
+		std::remove(tempPath.c_str());
+		Log("GBAStation GameDB replace could not stage existing file path=%s errno=%d", path.c_str(), error);
+		return false;
+	}
+	if (std::rename(tempPath.c_str(), path.c_str()) == 0) {
+		std::remove(backupPath.c_str());
+		return true;
+	}
+	const int error = errno;
+	if (std::rename(backupPath.c_str(), path.c_str()) != 0) {
+		Log("GBAStation GameDB restore failed; backup retained path=%s", backupPath.c_str());
+	}
+	std::remove(tempPath.c_str());
+	Log("GBAStation GameDB replace failed path=%s errno=%d", path.c_str(), error);
+	return false;
+}
+
 std::string CurrentPsTimestamp() {
     std::time_t now = std::time(nullptr);
     std::tm local{};
@@ -1300,16 +1407,239 @@ std::string CurrentPsTimestamp() {
 // 启动时一次读入并缓存 GameDB 匹配条目；title/logoPath 的更新直接改缓存，
 // 最后由 FlushPspGameDb 统一写回一次。
 void FlushPspGameDb() {
-    if (!g_state.gameDbLoaded || !g_state.gameDbDirty || g_state.gameDbPath.empty())
-        return;
-    std::ofstream out(g_state.gameDbPath, std::ios::trunc);
-    if (out) {
-        out << g_state.gameDbData.dump(4);
-        Log("GBAStation GameDB flushed %s", g_state.gameDbPath.c_str());
-    } else {
-        Log("GBAStation GameDB write failed: %s", g_state.gameDbPath.c_str());
-    }
-    g_state.gameDbDirty = false;
+	if (!g_state.gameDbLoaded || !g_state.gameDbDirty || g_state.gameDbPath.empty()) {
+		return;
+	}
+	if (WriteGameDbAtomically(g_state.gameDbPath, g_state.gameDbData)) {
+		Log("GBAStation GameDB flushed %s", g_state.gameDbPath.c_str());
+		g_state.gameDbDirty = false;
+	} else {
+		Log("GBAStation GameDB write failed: %s", g_state.gameDbPath.c_str());
+	}
+}
+
+void ApplyPspGameDbDisplaySettings(const nlohmann::json &item) {
+	// These names match the generic GameDB schema already used by FBNeo and
+	// 3DS.  Missing values intentionally leave the user's global defaults in
+	// place, preserving backward compatibility with existing entries.
+	const int displayMode = JsonIntOr(item, "displayMode", -1);
+	const int internalResolution = JsonIntOr(item, "ndsInternalResolution", -1);
+	std::string screenLayout = JsonStringOr(item, "ndsScreenLayout");
+	int integerScale = 0;
+	if (const auto stored = item.find("integerAspectRatio"); stored != item.end() && stored->is_number())
+		integerScale = std::clamp((int)std::lround(stored->get<float>()), 1, 4);
+	else if (const auto legacy = item.find("ndsIntegerScale"); legacy != item.end() &&
+		(legacy->is_number_integer() || legacy->is_number_unsigned()))
+		// One-way migration for older builds that incorrectly wrote the
+		// multiplier into the boolean NDS metadata field.
+		integerScale = std::clamp(JsonIntOr(item, "ndsIntegerScale", 1), 1, 4);
+	if (displayMode == static_cast<int>(DisplayMode::Integer) && integerScale >= 1)
+		screenLayout = std::to_string(integerScale) + "x";
+	const float customScale = std::clamp(item.value("customScale", 1.0f), 0.5f, 5.0f);
+	// GameDB custom offsets are pixel deltas from the centred position.
+	const float customOffsetX = 0.5f + item.value("customOffsetX", 0.0f) / std::max(1, g_display.pixel_xres);
+	const float customOffsetY = 0.5f + item.value("customOffsetY", 0.0f) / std::max(1, g_display.pixel_yres);
+	if (displayMode < 0 && internalResolution < 0 && screenLayout.empty())
+		return;
+	const int previousResolution = g_Config.iInternalResolution;
+	if (g_state.overlay.IsReady()) {
+		g_state.overlay.SetGameDisplaySettings(displayMode, screenLayout, internalResolution,
+			customScale, customOffsetX, customOffsetY);
+		// GameDB is loaded after the Vulkan GPU has been created.  Merely changing
+		// g_Config here updated the menu label, but left the existing render targets
+		// at the startup resolution.  Queue the same live resize path used by the
+		// selector so the displayed multiplier always matches the active one.
+		if (g_Config.iInternalResolution != previousResolution) {
+			g_state.runtimeSettingsDirty = true;
+			g_state.settingsRenderResized = true;
+			Log("GBAStation GameDB display resolution applied old=%d new=%d", previousResolution,
+				g_Config.iInternalResolution);
+		}
+	}
+}
+
+void ApplyPspGameDbShaderSettings(const nlohmann::json &item) {
+	// Keep the selected filter separately from its enabled state, so the menu
+	// switch can disable it without forgetting the choice needed to restore it.
+	const bool enabled = JsonBoolOr(item, "shaderEnabled");
+	const std::string preset = NormalizeGameDbPath(JsonStringOr(item, "shaderPath"));
+	if (!preset.empty() && preset.size() >= 7 && preset.compare(preset.size() - 7, 7, ".slangp") == 0) {
+		std::string error;
+		if (!RegisterSlangPresetPath(preset, &error))
+			Log("GBAStation Slang GameDB register failed file=%s error=%s", preset.c_str(), error.c_str());
+		else
+			ReloadAllPostShaderInfo(nullptr);
+	}
+	if (!enabled) {
+		g_Config.vPostShaderNames.clear();
+		if (g_state.overlay.IsReady())
+			g_state.overlay.SetGameShaderSettings(false, preset);
+		return;
+	}
+	if (preset.empty()) {
+		g_Config.vPostShaderNames.clear();
+		if (g_state.overlay.IsReady())
+			g_state.overlay.SetGameShaderSettings(true, "");
+		return;
+	}
+	const ShaderInfo *info = GetPostShaderInfo(preset);
+	// The GameDB stores the user-facing built-in filter name.  Accept the old
+	// section identifier as well so existing entries migrate on their next save.
+	if (!info) {
+		for (const ShaderInfo &candidate : GetAllPostShaderInfo()) {
+			if (!candidate.isSlang && candidate.name == preset) {
+				info = &candidate;
+				break;
+			}
+		}
+	}
+	if (!info || info->section == "Off") {
+		g_Config.vPostShaderNames.clear();
+		if (g_state.overlay.IsReady())
+			g_state.overlay.SetGameShaderSettings(true, preset);
+		return;
+	}
+	g_Config.vPostShaderNames.assign(1, info->section);
+	FixPostShaderOrder(&g_Config.vPostShaderNames);
+	if (g_state.overlay.IsReady())
+		g_state.overlay.SetGameShaderSettings(true, info->section);
+	const auto names = item.value("shaderParaNames", std::vector<std::string>{});
+	const auto values = item.value("shaderParaValues", std::vector<float>{});
+	for (size_t i = 0; i < names.size() && i < values.size(); ++i) {
+		const std::string key = StringFromFormat("%sSettingCurrentValue%u", info->section.c_str(), (unsigned)i + 1);
+		g_Config.mPostShaderSetting[key] = values[i];
+	}
+}
+
+void SavePspGameDbDisplaySettings() {
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size())
+		return;
+	auto &item = g_state.gameDbData[g_state.gameDbIndex];
+	if (!item.is_object())
+		return;
+	item["displayMode"] = g_state.overlay.GameDisplayModeIndex();
+	item["ndsScreenLayout"] = g_state.overlay.GameScreenLayout();
+	// The shared launcher schema clamps this NDS-named storage field to 1..4.
+	// Do not create an unrepresentable 5x per-game value: it would be silently
+	// reduced to 4x by the launcher and make synchronization appear to fail.
+	item["ndsInternalResolution"] = std::clamp(g_Config.iInternalResolution, 1, 4);
+	item["customScale"] = g_state.overlay.GameCustomDisplayScale();
+	item["customOffsetX"] = (g_state.overlay.GameCustomDisplayOffsetX() - 0.5f) * std::max(1, g_display.pixel_xres);
+	item["customOffsetY"] = (g_state.overlay.GameCustomDisplayOffsetY() - 0.5f) * std::max(1, g_display.pixel_yres);
+	const std::string layout = g_state.overlay.GameScreenLayout();
+	const float integerScale = layout == "1x" ? 1.0f : layout == "2x" ? 2.0f : layout == "3x" ? 3.0f : layout == "4x" ? 4.0f : 1.0f;
+	// The launcher deserializes this field as bool; the multiplier belongs in
+	// the schema-approved float integerAspectRatio.
+	item["ndsIntegerScale"] = JsonBoolOr(item, "ndsIntegerScale", true);
+	item["integerAspectRatio"] = integerScale;
+	// These were an earlier PPSSPP-only extension.  Keep GameDB on the shared
+	// schema instead of introducing parallel custom-display keys.
+	item.erase("ppssppCustomScale");
+	item.erase("ppssppCustomOffsetX");
+	item.erase("ppssppCustomOffsetY");
+	g_state.gameDbDirty = true;
+	FlushPspGameDb();
+}
+
+void SavePspGameDbShaderSettings() {
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size())
+		return;
+	auto &item = g_state.gameDbData[g_state.gameDbIndex];
+	if (!item.is_object())
+		return;
+	const std::string section = g_state.overlay.GameShaderSection();
+	const ShaderInfo *shader = section.empty() ? nullptr : GetPostShaderInfo(section);
+	const bool validShader = shader && shader->section != "Off";
+	item["shaderEnabled"] = g_state.overlay.IsGameShaderEnabled();
+	// This existing schema string now stores the selected built-in filter's
+	// display name, rather than a custom shader file path.
+	item["shaderPath"] = validShader ? shader->name : std::string();
+	// The shared schema reserves this legacy field for launcher parameter files;
+	// Slang parameters are stored in the arrays below.
+	item["shaderParaPath"] = "";
+	std::vector<std::string> names;
+	std::vector<float> values;
+	if (shader) {
+		for (size_t i = 0; i < ARRAY_SIZE(shader->settings); ++i) {
+			if (shader->settings[i].name.empty())
+				continue;
+			names.emplace_back(shader->settings[i].name);
+			const std::string key = StringFromFormat("%sSettingCurrentValue%u", shader->section.c_str(), (unsigned)i + 1);
+			auto it = g_Config.mPostShaderSetting.find(key);
+			values.push_back(it == g_Config.mPostShaderSetting.end() ? shader->settings[i].value : it->second);
+		}
+	}
+	item["shaderParaNames"] = std::move(names);
+	item["shaderParaValues"] = std::move(values);
+	g_state.gameDbDirty = true;
+	FlushPspGameDb();
+}
+
+template <typename Apply>
+void SyncPspGameDb(const char *label, Apply apply) {
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size()) {
+		Log("GBAStation GameDB %s sync skipped: no current entry", label);
+		return;
+	}
+	int updated = 0;
+	for (size_t index = 0; index < g_state.gameDbData.size(); ++index) {
+		if (index == g_state.gameDbIndex || !g_state.gameDbData[index].is_object()) {
+			continue;
+		}
+		apply(g_state.gameDbData[index]);
+		++updated;
+	}
+	if (updated == 0) {
+		Log("GBAStation GameDB %s sync: no other PSP entries", label);
+		return;
+	}
+	g_state.gameDbDirty = true;
+	FlushPspGameDb();
+	Log("GBAStation GameDB synced %s to %d other PSP entries", label, updated);
+}
+
+void SyncPspGameDbDisplaySettings() {
+	SavePspGameDbDisplaySettings();
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size()) return;
+	const auto &source = g_state.gameDbData[g_state.gameDbIndex];
+	const int mode = JsonIntOr(source, "displayMode", -1);
+	const int storedResolution = JsonIntOr(source, "ndsInternalResolution", -1);
+	const int resolution = storedResolution < 1 ? -1 : std::clamp(storedResolution, 1, 4);
+	const std::string layout = JsonStringOr(source, "ndsScreenLayout");
+	const float integerScale = source.value("integerAspectRatio", 1.0f);
+	const float customScale = source.value("customScale", 1.0f);
+	const float customOffsetX = source.value("customOffsetX", 0.0f);
+	const float customOffsetY = source.value("customOffsetY", 0.0f);
+	SyncPspGameDb("display settings", [=](nlohmann::json &item) {
+		item["displayMode"] = mode;
+		item["ndsInternalResolution"] = resolution;
+		item["ndsScreenLayout"] = layout;
+		item["customScale"] = customScale;
+		item["customOffsetX"] = customOffsetX;
+		item["customOffsetY"] = customOffsetY;
+		item["integerAspectRatio"] = integerScale;
+		item["ndsIntegerScale"] = JsonBoolOr(item, "ndsIntegerScale", true);
+		item.erase("ppssppCustomScale");
+		item.erase("ppssppCustomOffsetX");
+		item.erase("ppssppCustomOffsetY");
+	});
+}
+
+void SyncPspGameDbShaderSettings() {
+	SavePspGameDbShaderSettings();
+	if (!g_state.gameDbLoaded || g_state.gameDbIndex >= g_state.gameDbData.size()) return;
+	const auto &source = g_state.gameDbData[g_state.gameDbIndex];
+	const bool enabled = JsonBoolOr(source, "shaderEnabled");
+	const std::string path = NormalizeGameDbPath(JsonStringOr(source, "shaderPath"));
+	const auto names = source.value("shaderParaNames", std::vector<std::string>{});
+	const auto values = source.value("shaderParaValues", std::vector<float>{});
+	SyncPspGameDb("post shader settings", [=](nlohmann::json &item) {
+		item["shaderEnabled"] = enabled;
+		item["shaderPath"] = path;
+		item["shaderParaPath"] = "";
+		item["shaderParaNames"] = names;
+		item["shaderParaValues"] = values;
+	});
 }
 
 void LoadPspPlayStats(const std::string& romPath) {
@@ -1342,18 +1672,27 @@ void LoadPspPlayStats(const std::string& romPath) {
         for (size_t idx = 0; idx < data.size(); ++idx) {
             auto& item = data[idx];
             if (!item.is_object()) continue;
-            const std::string itemPath = item.value("path", std::string());
+            const std::string itemPath = JsonStringOr(item, "path");
             if (itemPath != romPath && NormalizePsRomPath(itemPath) != normalized) continue;
             g_state.playStatsFound = true;
-            g_state.playCount = item.value("playCount", 0) + 1;
-            g_state.playTimeTotal = item.value("playTime", 0);
-            g_state.savePath = item.value("savePath", std::string());
+            g_state.playCount = JsonIntOr(item, "playCount") + 1;
+            g_state.playTimeTotal = JsonIntOr(item, "playTime");
+            g_state.savePath = NormalizeGameDbPath(JsonStringOr(item, "savePath"));
+            // Repair the common sdmc: spelling while this entry is already
+            // being updated for its play counter.  The launcher consumes the
+            // normalized schema paths on its next scan.
+            item["savePath"] = g_state.savePath;
+			item["shaderPath"] = NormalizeGameDbPath(JsonStringOr(item, "shaderPath"));
+            item["shaderParaPath"] = "";
             item["playCount"] = g_state.playCount;
             g_state.gameDbData = std::move(data);
             g_state.gameDbIndex = idx;
             g_state.gameDbPath = dbPath;
             g_state.gameDbLoaded = true;
-            g_state.gameDbDirty = true;
+			g_state.gameDbDirty = true;
+			const auto &cachedItem = g_state.gameDbData[g_state.gameDbIndex];
+			ApplyPspGameDbDisplaySettings(cachedItem);
+			ApplyPspGameDbShaderSettings(cachedItem);
             Log("GBAStation play stats start playCount=%d playTime=%d", g_state.playCount, g_state.playTimeTotal);
             return;
         }
@@ -1606,6 +1945,46 @@ void AfterSaveStateAction(SaveState::Status status, std::string_view message) {
 	RefreshSaveStateSlots(true);
 }
 
+void AfterExitSaveStateAction(SaveState::Status status, std::string_view message) {
+	AfterSaveStateAction(status, message);
+	if (status != SaveState::Status::FAILURE && !g_state.exitSavePath.empty()) {
+		// SaveState callbacks run from SaveState::Process() on the emulation
+		// thread, before Shutdown can release the captured framebuffer.
+		WriteStateThumbnail(g_state.exitSavePath);
+	}
+	g_state.exitSavePending = false;
+	g_state.exitSaveFinished = true;
+	Log("GBAStation exit auto save finished status=%d thumbnail=%s", (int)status,
+		status != SaveState::Status::FAILURE ? "written" : "skipped");
+}
+
+// Returns true when an asynchronous exit save was queued and exit must wait.
+bool BeginExitAutoSave() {
+	if (g_state.exitSavePending || g_state.exitSaveFinished) {
+		return true;
+	}
+	if (g_state.autoSaveOnExitSlot <= 0) {
+		return false;
+	}
+
+	const int slot = std::clamp(g_state.autoSaveOnExitSlot - 1, 0, Ppsspp::SaveStateSlotCount - 1);
+	const std::string statePath = GetPspSaveStatePath(slot);
+	if (statePath.empty()) {
+		Log("GBAStation exit auto save ignored: empty path slot=%d", slot);
+		return false;
+	}
+
+	File::CreateFullPath(Path(Paths::PpssppSaveStates));
+	g_state.exitSavePath = statePath;
+	g_state.exitSaveStartedMs = GetSystemMs();
+	g_state.exitSavePending = true;
+	g_state.exitSaveFinished = false;
+	g_state.overlay.SetExitSaving(true);
+	Log("GBAStation exit auto save start slot=%d path=%s", slot, statePath.c_str());
+	SaveState::Save(Path(statePath), slot, &AfterExitSaveStateAction);
+	return true;
+}
+
 bool WaitForPspBoot(const char *tag, std::string *errorString) {
 	int bootLoopCount = 0;
 	while (g_state.running && appletMainLoop() && PSP_InitUpdate(errorString) == BootState::Booting) {
@@ -1627,6 +2006,14 @@ bool WaitForPspBoot(const char *tag, std::string *errorString) {
 void ResetContent() {
 	if (!PSP_IsInited()) {
 		Log("GBAStation reset ignored: PSP is not initialized");
+		return;
+	}
+	if (UtilitySavedataIsActive()) {
+		// Do not destroy the emulated filesystem while a game save is still
+		// completing.  The next frames let the guest finish its savedata dialog;
+		// RunFrame will restart only after that handoff has ended.
+		g_state.resetPending = true;
+		Log("GBAStation reset deferred: PSP savedata dialog is active");
 		return;
 	}
 
@@ -1772,10 +2159,16 @@ float GetPspFastForwardMultiplier() {
 }
 
 void SetPspFastForwardMultiplier(float multiplier) {
-	g_state.fastForwardMultiplier = std::clamp(multiplier, 0.5f, 5.0f);
+	g_state.fastForwardMultiplier = multiplier <= 0.001f ? 0.0f : std::clamp(multiplier, 0.5f, 5.0f);
+	g_state.fastForwardSettingsSavePending = true;
+}
+
+void SavePspFastForwardSettings() {
 	char buf[32];
 	std::snprintf(buf, sizeof(buf), "%.2f", g_state.fastForwardMultiplier);
 	WriteConfigValue("fastforward.multiplier", buf);
+	WriteConfigValue("fastforward.mode", g_state.fastForwardToggleMode ? "toggle" : "hold");
+	g_state.fastForwardSettingsSavePending = false;
 }
 
 bool GetPspFastForwardToggleMode() {
@@ -1787,7 +2180,7 @@ void SetPspFastForwardToggleMode(bool toggleMode) {
 	if (!toggleMode) {
 		g_state.fastForwardToggle = false;
 	}
-	WriteConfigValue("fastforward.mode", toggleMode ? "toggle" : "hold");
+	g_state.fastForwardSettingsSavePending = true;
 }
 
 double GetPspCurrentFps() {
@@ -1801,11 +2194,19 @@ bool GetPspFastForwardActive() {
 bool GetPspShowFps() {
 	const auto it = g_state.gbastationConfig.find("display.showFps");
 	if (it == g_state.gbastationConfig.end()) {
+		return true;
+	}
+	std::string value = Trim(it->second);
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+		return (char)std::tolower(c);
+	});
+	if (value == "false" || value == "0" || value == "off" || value == "disabled") {
 		return false;
 	}
-	return it->second == "true" || it->second == "1";
+	// Preserve the Flycast/launcher default for true, typed, or malformed
+	// values so a missing/legacy key never makes the FPS HUD disappear.
+	return true;
 }
-
 
 PpssppRuntime::PpssppRuntime(LogCallback log) : log_(std::move(log)) {
 	g_state.log = log_;
@@ -1817,6 +2218,7 @@ bool PpssppRuntime::Configure(const LaunchInfo &launch) {
 	g_state.running = true;
 	g_state.booted = false;
 	g_state.ppssppShutdown = false;
+	g_state.resetPending = false;
 	g_state.chainloadLauncher = false;
 	g_state.frameOpen = false;
 	g_state.hostFrameOpen = false;
@@ -1964,20 +2366,70 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 		g_state.pspInputSuppressFrames = 3;
 	}
 	if (g_state.overlay.ConsumeCoreSettingsChanged()) {
-		SaveGBAStationPpssppRuntimeSettings();
-		g_state.runtimeSettingsDirty = true;
-		g_state.settingsRenderResized =
-			g_Config.iInternalResolution != prevResolution ||
+		// Keep LR adjustment entirely in memory while the menu is open.  The
+		// final value is applied and persisted only when the menu closes (or
+		// during Shutdown for a direct exit).
+		g_state.runtimeSettingsSavePending = true;
+		g_state.settingsRenderResized = g_state.settingsRenderResized ||
 			g_Config.bSkipBufferEffects != prevSkipBufferEffects;
-		g_state.settingsJitClear = g_Config.bFastMemory != prevFastMemory;
-		Log("queued PPSSPP runtime core settings");
+		g_state.settingsJitClear = g_state.settingsJitClear || g_Config.bFastMemory != prevFastMemory;
+		Log("queued PPSSPP runtime core settings (debounced)");
+	}
+	if (g_state.overlay.ConsumeGameDisplaySettingsSaveRequest()) {
+		g_state.gameDisplaySettingsSavePending = true;
+		// Per-game resolution changes still need the live GPU targets to be
+		// recreated, but do not require saving the global PPSSPP configuration.
+		if (g_Config.iInternalResolution != prevResolution) {
+			g_state.runtimeSettingsDirty = true;
+			g_state.settingsRenderResized = true;
+		}
+	}
+	if (g_state.overlay.ConsumeGameShaderSettingsSaveRequest()) {
+		SavePspGameDbShaderSettings();
+	}
+	if (g_state.overlay.ConsumeSyncDisplaySettingsRequest()) {
+		SyncPspGameDbDisplaySettings();
+	}
+	if (g_state.overlay.ConsumeSyncShaderSettingsRequest()) {
+		SyncPspGameDbShaderSettings();
+	}
+	if (wasOverlayVisible && !g_state.overlay.IsVisible()) {
+		if (g_state.runtimeSettingsSavePending) {
+			SaveGBAStationPpssppRuntimeSettings();
+			g_state.runtimeSettingsSavePending = false;
+			g_state.runtimeSettingsDirty = true;
+			Log("applied PPSSPP runtime settings after menu close");
+		}
+		if (g_state.gameDisplaySettingsSavePending) {
+			SavePspGameDbDisplaySettings();
+			g_state.gameDisplaySettingsSavePending = false;
+			Log("saved PSP GameDB display settings after menu close");
+		}
+		if (g_state.fastForwardSettingsSavePending) {
+			SavePspFastForwardSettings();
+			Log("saved fast forward settings after menu close");
+		}
 	}
 	ExecuteOverlayCommand(g_state.overlay.ConsumeCommand());
 	if (g_state.overlay.ShouldExitGame()) {
 		Log("GBAStation overlay exit requested");
 		g_state.overlay.ClearExitRequest();
 		g_state.chainloadLauncher = true;
-		RequestExit();
+		// A native PSP save is not complete merely because its UI has reported
+		// success.  Let sceUtility finish its worker and guest-side shutdown
+		// before we pause the game for the exit savestate.
+		if (UtilitySavedataIsActive()) {
+			g_state.exitWaitingForNativeSave = true;
+			g_state.exitNativeSaveClearMs = 0;
+			g_state.overlay.SetExitSaving(true, true);
+			ClearPspInput();
+			g_state.fastForwardActive = false;
+			PSP_CoreParameter().fastForward = false;
+			PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
+			Log("GBAStation exit deferred: PSP native savedata dialog is active");
+		} else if (!BeginExitAutoSave()) {
+			RequestExit();
+		}
 		return;
 	}
 
@@ -2008,10 +2460,13 @@ void PpssppRuntime::HandleInput(const FrameInput &input) {
 			? g_state.fastForwardToggle
 			: ffHeld;
 		g_state.fastForwardActive = ffActive;
-		PSP_CoreParameter().fastForward = ffActive;
+		// In PPSSPP, fastForward=true has priority over CUSTOM1 and removes
+		// the display limiter altogether.  Reserve it for the explicit
+		// "unlimited" option; finite GBAStation multipliers use CUSTOM1 only.
+		PSP_CoreParameter().fastForward = ffActive && g_state.fastForwardMultiplier <= 0.001f;
 		if (ffActive && g_state.fastForwardMultiplier > 1.001f) {
 			PSP_CoreParameter().fpsLimit = FPSLimit::CUSTOM1;
-			g_Config.iFpsLimit1 = std::max(1, static_cast<int>(60.0f * g_state.fastForwardMultiplier));
+			g_Config.iFpsLimit1 = std::max(1, static_cast<int>(std::lround(60.0f * g_state.fastForwardMultiplier)));
 		} else {
 			PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
 		}
@@ -2042,29 +2497,18 @@ void PpssppRuntime::RunFrame() {
 		Log("main loop entered");
 	}
 	g_state.frameCount++;
-	// HUD FPS: measure every 500 ms so the value updates ~2x per second.
-	{
-		const u64 nowMs = (u64)(time_now_d() * 1000.0);
-		if (g_state.fpsWindowStartMs == 0) {
-			g_state.fpsWindowStartMs = nowMs;
-		} else {
-			++g_state.fpsFrameCount;
-			if (nowMs - g_state.fpsWindowStartMs >= 500) {
-				const double seconds = (double)(nowMs - g_state.fpsWindowStartMs) / 1000.0;
-				if (seconds > 0.0) {
-					g_state.fps = (double)g_state.fpsFrameCount / seconds;
-				}
-				g_state.fpsFrameCount = 0;
-				g_state.fpsWindowStartMs = nowMs;
-			}
-		}
-	}
 	UpdateDisplayMode();
 	if (g_state.graphicsContext) {
 		g_state.graphicsContext->Poll();
 	}
 	DrainMainThreadQueue();
 	RetroAchievements().Idle();
+	if (g_state.resetPending && !UtilitySavedataIsActive()) {
+		g_state.resetPending = false;
+		Log("GBAStation deferred reset proceeding after savedata completion");
+		ResetContent();
+		return;
+	}
 	PSP_UpdateDebugStats((DebugOverlay)g_Config.iDebugOverlay == DebugOverlay::DEBUG_STATS || g_Config.bLogFrameDrops);
 
 	const DisplayLayoutConfig &displayLayoutConfig = g_Config.GetDisplayLayoutConfig(DeviceOrientation::Landscape);
@@ -2073,12 +2517,49 @@ void PpssppRuntime::RunFrame() {
 	// Save/load requests are queued by SaveState::Save/Load and must be
 	// flushed explicitly each frame, matching PPSSPP's normal EmuScreen path.
 	SaveState::Process();
+	if (g_state.exitWaitingForNativeSave) {
+		constexpr u64 kNativeSaveSettleMs = 400;
+		const u64 nowMs = GetSystemMs();
+		if (UtilitySavedataIsActive()) {
+			// The dialog owns an asynchronous file writer; reset the stability
+			// timer whenever it is still active.
+			g_state.exitNativeSaveClearMs = 0;
+		} else if (g_state.exitNativeSaveClearMs == 0) {
+			g_state.exitNativeSaveClearMs = nowMs;
+			Log("GBAStation native savedata completed; waiting %llums before exit", (unsigned long long)kNativeSaveSettleMs);
+		} else if (nowMs == 0 || nowMs - g_state.exitNativeSaveClearMs >= kNativeSaveSettleMs) {
+			g_state.exitWaitingForNativeSave = false;
+			g_state.overlay.SetExitSaving(true);
+			Log("GBAStation native savedata settle complete; starting exit savestate");
+			if (!BeginExitAutoSave()) {
+				g_state.overlay.SetExitSaving(false);
+				RequestExit();
+				return;
+			}
+		}
+	}
+	if (g_state.exitSaveFinished) {
+		// Keep the confirmation visible briefly even when the state write was
+		// very fast, so it is clear that the game is deliberately waiting.
+		constexpr u64 kExitSaveDialogMinMs = 400;
+		const u64 nowMs = GetSystemMs();
+		if (nowMs == 0 || nowMs - g_state.exitSaveStartedMs >= kExitSaveDialogMinMs) {
+			g_state.overlay.SetExitSaving(false);
+			Log("GBAStation exit auto save complete; leaving game");
+			RequestExit();
+			return;
+		}
+	}
 
 	if (g_state.draw) {
 		g_state.draw->BeginFrame(Draw::DebugFlags::NONE);
 		g_state.frameOpen = true;
 		if (!g_state.overlay.IsReady()) {
 			g_state.overlay.Init(g_state.draw, g_state.contentPath.c_str(), g_state.log);
+			if (g_state.gameDbLoaded && g_state.gameDbIndex < g_state.gameDbData.size()) {
+				ApplyPspGameDbDisplaySettings(g_state.gameDbData[g_state.gameDbIndex]);
+				ApplyPspGameDbShaderSettings(g_state.gameDbData[g_state.gameDbIndex]);
+			}
 			RefreshCheatAvailability();
 		}
 	}
@@ -2103,11 +2584,19 @@ void PpssppRuntime::RunFrame() {
 		}
 	}
 
-	if (g_state.overlay.IsVisible()) {
+	if (g_state.overlay.IsVisible() && !g_state.exitWaitingForNativeSave) {
 		sleep_ms(1, "GBAStation-overlay-pause");
 	} else {
 		RetroAchievements().FrameUpdate();
 		PSP_RunLoopWhileState();
+	}
+	// Use PPSSPP's emulated VBlank rate for the HUD, rather than the host
+	// render-loop rate.  The latter is normally capped by the Switch display at
+	// 60 Hz even while the emulator is running at 2x/3x/etc.
+	float emulatedVps = 0.0f;
+	__DisplayGetFPS(&emulatedVps, nullptr, nullptr);
+	if (std::isfinite(emulatedVps) && emulatedVps > 0.0f) {
+		g_state.fps = emulatedVps;
 	}
 
 	if (coreState == CORE_NEXTFRAME) {
@@ -2197,9 +2686,22 @@ void PpssppRuntime::RequestExit() {
 
 void PpssppRuntime::Shutdown() {
 	Log("ppsspp runtime shutdown start frames=%d coreState=%d running=%d", g_state.frameCount, (int)coreState, g_state.running ? 1 : 0);
-	// Exit autosave: save the configured slot before tearing the core down,
-	// then flush the async queue once since RunFrame no longer runs.
-	if (g_state.autoSaveOnExitSlot > 0) {
+	// Do not lose the last selector value when the user exits before its
+	// debounce window expires.
+	if (g_state.runtimeSettingsSavePending) {
+		SaveGBAStationPpssppRuntimeSettings();
+		g_state.runtimeSettingsSavePending = false;
+	}
+	if (g_state.gameDisplaySettingsSavePending) {
+		SavePspGameDbDisplaySettings();
+		g_state.gameDisplaySettingsSavePending = false;
+	}
+	if (g_state.fastForwardSettingsSavePending) {
+		SavePspFastForwardSettings();
+	}
+	// Direct system exits bypass the menu's progress dialog.  Keep this
+	// fallback, but skip it after the menu path has already saved the slot.
+	if (g_state.autoSaveOnExitSlot > 0 && !g_state.exitSaveFinished) {
 		const int slot = std::clamp(g_state.autoSaveOnExitSlot - 1, 0, Ppsspp::SaveStateSlotCount - 1);
 		const std::string statePath = GetPspSaveStatePath(slot);
 		Log("GBAStation auto save on exit slot=%d path=%s", slot, statePath.c_str());
@@ -2207,6 +2709,7 @@ void PpssppRuntime::Shutdown() {
 			File::CreateFullPath(Path(Paths::PpssppSaveStates));
 			SaveState::Save(Path(statePath), slot, &AfterSaveStateAction);
 			SaveState::Process();
+			WriteStateThumbnail(statePath);
 		}
 	}
 	// Exit: update title/logoPath in the cached GameDB entry. These follow their
@@ -2279,6 +2782,19 @@ void RuntimeAudioPushSamples(const s32 *audio, int numSamples, float volume) {
 		g_state.resampler.PushSamples(audio, numSamples, volume);
 	} else {
 		g_state.resampler.Clear();
+	}
+}
+
+void PersistPspGameDbShaderSettings() {
+	SavePspGameDbShaderSettings();
+}
+
+void NotifyPspGpuConfigChanged() {
+	const char *first = g_Config.vPostShaderNames.empty() ? "<off>" : g_Config.vPostShaderNames.front().c_str();
+	Log("GBAStation GPU config changed postShaderCount=%u first=%s gpu=%p",
+		(unsigned)g_Config.vPostShaderNames.size(), first, (void *)gpu);
+	if (gpu) {
+		gpu->NotifyConfigChanged();
 	}
 }
 
@@ -2383,7 +2899,27 @@ bool System_GetPropertyBool(SystemProperty prop) {
 void System_Notify(SystemNotification) {
 }
 
-void System_PostUIMessage(UIMessage, std::string_view) {
+void System_PostUIMessage(UIMessage message, std::string_view) {
+	// The standalone GBAStation host has no NativeApp message loop.  PPSSPP UI
+	// screens normally use this route for dynamic post-processing changes, so
+	// forwarding it here is essential for Slang enable/disable to rebuild the
+	// presentation chain on the next host frame.
+	if (!gpu) {
+		return;
+	}
+	switch (message) {
+	case UIMessage::GPU_CONFIG_CHANGED:
+		GBAStation::NotifyPspGpuConfigChanged();
+		break;
+	case UIMessage::GPU_RENDER_RESIZED:
+		gpu->NotifyRenderResized(g_Config.GetDisplayLayoutConfig(g_display.GetDeviceOrientation()));
+		break;
+	case UIMessage::GPU_DISPLAY_RESIZED:
+		gpu->NotifyDisplayResized();
+		break;
+	default:
+		break;
+	}
 }
 
 void System_RunOnMainThread(std::function<void()> func) {

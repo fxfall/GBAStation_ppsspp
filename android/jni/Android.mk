@@ -558,6 +558,11 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/GPU/Common/TransformCommon.cpp.arm \
   $(SRC)/GPU/Common/TextureDecoder.cpp \
   $(SRC)/GPU/Common/PostShader.cpp \
+  $(SRC)/GPU/Common/Slang/SlangRuntime.cpp \
+  $(SRC)/GPU/Common/Slang/slang_compile.cpp \
+  $(SRC)/GPU/Common/Slang/slang_process.cpp \
+  $(SRC)/GPU/Common/Slang/slang_reflection.cpp \
+  $(SRC)/GPU/Common/Slang/slangp_parser.cpp \
   $(SRC)/GPU/Common/ShaderUniforms.cpp \
   $(SRC)/GPU/Common/VertexShaderGenerator.cpp \
   $(SRC)/GPU/Common/GeometryShaderGenerator.cpp \
@@ -933,6 +938,7 @@ LOCAL_SRC_FILES := \
   $(SRC)/UI/DevScreens.cpp \
   $(SRC)/UI/DriverManagerScreen.cpp \
   $(SRC)/UI/DisplayLayoutScreen.cpp \
+  $(SRC)/UI/SlangShaderScreen.cpp \
   $(SRC)/UI/EmuScreen.cpp \
   $(SRC)/UI/GameBrowser.cpp \
   $(SRC)/UI/MainScreen.cpp \

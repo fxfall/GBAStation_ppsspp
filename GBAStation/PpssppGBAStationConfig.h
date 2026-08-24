@@ -12,7 +12,8 @@ constexpr const char *kPpssppCoreConfigPath = Paths::PpssppCoreConfig;
 enum class DisplayMode {
 	Integer = 0,
 	Display = 1,
-	COUNT = 2,
+	Custom = 2,
+	COUNT = 3,
 };
 
 enum class DisplaySize {
@@ -30,6 +31,10 @@ enum class DisplaySize {
 struct DisplaySettings {
 	DisplayMode mode = DisplayMode::Display;
 	DisplaySize size = DisplaySize::_16_9;
+	// PPSSPP stores custom layout coordinates normalized to the display.
+	float customScale = 1.0f;
+	float customOffsetX = 0.5f;
+	float customOffsetY = 0.5f;
 };
 
 class PpssppCoreConfig {

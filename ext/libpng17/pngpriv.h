@@ -2260,7 +2260,11 @@ PNG_INTERNAL_FUNCTION(void, png_init_filter_functions_neon,
 #include "pngdebug.h"
 
 /* EXTENSION SPECIFIC FUNCTIONS */
+/* The ARM NEON implementation is optional. Apple desktop builds disable it
+ * because the bundled ARM sources are not part of this checkout. */
+#if defined(PNG_ARM_NEON_OPT) && PNG_ARM_NEON_OPT > 0
 #include "arm/neon.h"
+#endif
 
 #ifdef __cplusplus
 }

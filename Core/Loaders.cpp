@@ -55,7 +55,7 @@ FileLoader *ConstructFileLoader(const Path &filename) {
 	// ROMX is a container, not a new PSP media format.  Present its typed
 	// entrypoint as a virtual .iso/.cso/.pbp file so the existing PPSSPP
 	// identification and filesystem code remains unchanged.
-	if (filename.GetFileExtension() == ".romx") {
+	if (equalsNoCase(filename.GetFileExtension(), ".romx")) {
 		return new RomxFileLoader(filename);
 	}
 

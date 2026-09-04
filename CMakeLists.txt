@@ -224,17 +224,6 @@ option(GOLD "Gold build" OFF)
 set(SWITCH_VULKAN_LIBRARY "" CACHE FILEPATH "Optional override for the Switch libvulkan.a archive")
 set(RCHEEVOS_ROOT "${CMAKE_SOURCE_DIR}/rcheevos" CACHE PATH "Path to the rcheevos source tree")
 
-# ROMX 0.2.0 support is kept as an independent C library.  The PPSSPP core
-# only consumes its read-only entrypoint API; mutable SAVE/CHEAT/STATS handling
-# remains in the frontend.
-set(ROMX_BUILD_TESTS OFF CACHE BOOL "Build libromx tests" FORCE)
-set(ROMX_BUILD_EXAMPLES OFF CACHE BOOL "Build libromx examples" FORCE)
-add_subdirectory(third_party/libromx EXCLUDE_FROM_ALL)
-# libromx's POSIX file backend also builds its optional mmap path.  Reuse the
-# existing Switch mmap shim when this core is compiled with libnx; on desktop
-# the shim forwards to the platform's real <sys/mman.h>.
-target_include_directories(romx PRIVATE "${CMAKE_SOURCE_DIR}/Common")
-
 if(USE_LIBNX)
 	set(USING_EGL ON CACHE BOOL "Set to ON if target environment uses EGL" FORCE)
 	set(USING_GLES2 ON CACHE BOOL "Set to ON if target device uses OpenGL ES 2.0" FORCE)
@@ -1347,8 +1336,10 @@ target_link_libraries(7zip)
 include_directories(ext/lzma-sdk)
 set(LIB7ZIP_LIBRARY 7zip)
 
-# Arm platforms require at least libpng17.
-if(ANDROID OR ARMV7 OR ARM64 OR ARM OR IOS)
+# Android and ARM handheld targets require at least libpng17. Apple desktop
+# builds use the baseline libpng sources; the repository does not carry the
+# ARM NEON files referenced by the generic ARM64 fallback below.
+if((ANDROID OR ARMV7 OR ARM64 OR ARM OR IOS) AND NOT MACOSX)
 	set(PNG_REQUIRED_VERSION 1.7)
 else()
 	set(PNG_REQUIRED_VERSION 1.6)
@@ -1366,7 +1357,7 @@ else()
 			ext/libpng17/arm/filter_neon.S
 			ext/libpng17/arm/filter_neon_intrinsics.c
 		)
-	elseif(ARM64)
+	elseif(ARM64 AND NOT MACOSX)
 		set(PNG_ARM_INCLUDES
 			ext/libpng17/arm/arm_init.c
 			ext/libpng17/arm/filter_neon_intrinsics.c
@@ -2573,8 +2564,6 @@ add_library(${CoreLibName} ${CoreLinkType}
 	Core/FileLoaders/HTTPFileLoader.h
 	Core/FileLoaders/LocalFileLoader.cpp
 	Core/FileLoaders/LocalFileLoader.h
-	Core/FileLoaders/RomxFileLoader.cpp
-	Core/FileLoaders/RomxFileLoader.h
 	Core/FileLoaders/RamCachingFileLoader.cpp
 	Core/FileLoaders/RamCachingFileLoader.h
 	Core/FileLoaders/RetryingFileLoader.cpp
@@ -2741,8 +2730,12 @@ if(USE_LIBNX)
 	set(PPSSPP_DL_LIBS)
 endif()
 
-target_link_libraries(${CoreLibName} Common native chdr kirk cityhash sfmt19937 xbrz xxhash rcheevos minimp3 at3_standalone lua romx ${GlslangLibs}
+target_link_libraries(${CoreLibName} Common native chdr kirk cityhash sfmt19937 xbrz xxhash rcheevos minimp3 at3_standalone lua ${GlslangLibs}
 	${CoreExtraLibs} ${OPENGL_LIBRARIES} ${X11_LIBRARIES} ${PPSSPP_DL_LIBS})
+
+# Keep the downstream ROMX integration in one include so upstream CMake
+# changes do not collide with dependency, source-list, and link-list edits.
+include(cmake/GBAStationRomx.cmake)
 
 # Winsock
 if(WIN32)

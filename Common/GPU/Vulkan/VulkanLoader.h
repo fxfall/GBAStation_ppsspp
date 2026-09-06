@@ -38,7 +38,14 @@
 #define VK_ENABLE_BETA_EXTENSIONS				1		// VK_KHR_portability_subset
 #endif
 
+#if PPSSPP_PLATFORM(SWITCH)
+// The Switch NVK archive and its SDK are generated as one Vulkan ABI.  Avoid
+// the repository-relative include here so an older vendored header cannot be
+// selected ahead of the SDK's current Vulkan-Headers copy.
+#include <vulkan/vulkan.h>
+#else
 #include "ext/vulkan/vulkan.h"
+#endif
 #include <string>
 
 // Hacky X11 header workaround

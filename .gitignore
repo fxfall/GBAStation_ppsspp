@@ -157,4 +157,5 @@ GBAStation-ppsspp
 
 build_switch_GBAStation
 build_switch_minimal
+.codex_tmp/
 GBAStationPPSSPPStub.nro

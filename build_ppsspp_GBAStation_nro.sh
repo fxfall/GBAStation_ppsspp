@@ -13,16 +13,19 @@ export TMPDIR="${SCRIPT_DIR}/.codex_tmp/msys_tmp"
 export TMP="${TMPDIR}"
 export TEMP="${TMPDIR}"
 mkdir -p "${TMPDIR}"
-if [ -z "${MESA_NVK_DIR:-}" ]; then
-	for candidate in \
-		"${SCRIPT_DIR}/../switchVK/nvk-switch-26.1.4" \
-		"${SCRIPT_DIR}/../switchVK/nvk-switch-25.3.6" \
-		"/nvk-build"; do
-		if [ -d "${candidate}" ]; then
-			MESA_NVK_DIR="${candidate}"
-			break
-		fi
-	done
+SWITCHVK_HELPER="${SCRIPT_DIR}/../switchVK/switchvk-version.sh"
+if [ -f "${SWITCHVK_HELPER}" ]; then
+	# shellcheck disable=SC1090
+	source "${SWITCHVK_HELPER}"
+fi
+if [ -z "${MESA_NVK_DIR:-}" ] || [ "${MESA_NVK_DIR}" = "/nvk-build" ]; then
+	if command -v switchvk_find_sdk >/dev/null 2>&1; then
+		for sibling in "${SCRIPT_DIR}/../switchVK" "${SCRIPT_DIR}/../switch-nvk"; do
+			[ -d "${sibling}" ] || continue
+			MESA_NVK_DIR="$(switchvk_find_sdk "${sibling}" release || true)"
+			[ -n "${MESA_NVK_DIR}" ] && break
+		done
+	fi
 fi
 MESA_NVK_DIR="${MESA_NVK_DIR:-/nvk-build}"
 
@@ -165,7 +168,12 @@ fi
 
 cmake "${cmake_args[@]}"
 
-cmake --build "${BUILD_DIR}" -j"${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}" --target GBAStation-ppsspp_nro
+if command -v switchvk_default_jobs >/dev/null 2>&1; then
+	BUILD_JOBS="${CMAKE_BUILD_PARALLEL_LEVEL:-$(switchvk_default_jobs)}"
+else
+	BUILD_JOBS="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+fi
+cmake --build "${BUILD_DIR}" -j"${BUILD_JOBS}" --target GBAStation-ppsspp_nro
 
 if [ -f "${BUILD_DIR}/GBAStationPPSSPPStub.nro" ]; then
 	cp "${BUILD_DIR}/GBAStationPPSSPPStub.nro" "${SCRIPT_DIR}/GBAStationPPSSPPStub.nro"

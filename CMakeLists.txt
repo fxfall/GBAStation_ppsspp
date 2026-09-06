@@ -331,7 +331,9 @@ if(USE_LIBNX)
 			get_filename_component(SWITCH_VULKAN_LIBRARY_DIR "${SWITCH_VULKAN_LIBRARY}" DIRECTORY)
 			get_filename_component(SWITCH_VULKAN_SDK_ROOT "${SWITCH_VULKAN_LIBRARY_DIR}" DIRECTORY)
 			if(EXISTS "${SWITCH_VULKAN_SDK_ROOT}/include/vulkan/vulkan.h")
-				include_directories(SYSTEM "${SWITCH_VULKAN_SDK_ROOT}/include")
+				# The SDK owns the Vulkan ABI used by the linked NVK archive.  Put its
+				# headers before PPSSPP's older vendored copy.
+				include_directories(BEFORE SYSTEM "${SWITCH_VULKAN_SDK_ROOT}/include")
 			endif()
 		else()
 			find_library(VULKAN_LIBRARY vulkan REQUIRED)
@@ -1351,13 +1353,13 @@ endif()
 if(PNG_FOUND)
 	include_directories(${PNG_INCLUDE_DIRS})
 else()
-	if(ARM)
+	if(ARM AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ext/libpng17/arm/arm_init.c")
 		set(PNG_ARM_INCLUDES
 			ext/libpng17/arm/arm_init.c
 			ext/libpng17/arm/filter_neon.S
 			ext/libpng17/arm/filter_neon_intrinsics.c
 		)
-	elseif(ARM64 AND NOT MACOSX)
+	elseif(ARM64 AND NOT MACOSX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ext/libpng17/arm/arm_init.c")
 		set(PNG_ARM_INCLUDES
 			ext/libpng17/arm/arm_init.c
 			ext/libpng17/arm/filter_neon_intrinsics.c

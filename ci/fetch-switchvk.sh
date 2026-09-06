@@ -178,7 +178,8 @@ tar -xJf "$ARCHIVE" -C "$EXTRACTED"
 SDK_ROOT="$EXTRACTED/$SWITCHVK_ROOT_DIRECTORY"
 
 if [[ ! -f "$SDK_ROOT/lib/libvulkan.a" ]] ||
-   [[ ! -f "$SDK_ROOT/include/vulkan/vulkan.h" ]]; then
+   [[ ! -f "$SDK_ROOT/include/vulkan/vulkan.h" ]] ||
+   [[ ! -f "$SDK_ROOT/include/vk_video/vulkan_video_codec_h264std.h" ]]; then
     echo "ERROR: downloaded switchVK SDK is incomplete" >&2
     exit 1
 fi
